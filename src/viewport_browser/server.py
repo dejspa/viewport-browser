@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import sys
+
 from mcp.server.fastmcp import FastMCP, Image as MCPImage
 
 from .browser import BrowserManager
@@ -330,13 +333,56 @@ async def close_tab(index: int) -> list:
     return result
 
 
+def _start_dashboard():
+    """Start dashboard in background threads (non-blocking)."""
+    import threading
+    from .dashboard import _run_http, _ws_proxy, HTTP_PORT, WS_PORT
+    import websockets
+
+    http_thread = threading.Thread(target=_run_http, args=(HTTP_PORT,), daemon=True)
+    http_thread.start()
+
+    async def _run_ws():
+        async with websockets.serve(_ws_proxy, '0.0.0.0', WS_PORT, max_size=10_000_000):
+            await asyncio.Future()
+
+    ws_thread = threading.Thread(
+        target=lambda: asyncio.new_event_loop().run_until_complete(_run_ws()),
+        daemon=True,
+    )
+    ws_thread.start()
+    print(f"[viewport] Dashboard at http://localhost:{HTTP_PORT}", file=sys.stderr)
+
+
+async def _warmup_browser():
+    """Start browser immediately so CDP is ready for dashboard."""
+    await _get_browser()
+
+
 def main():
     import sys
     transport = sys.argv[1] if len(sys.argv) > 1 else "stdio"
+
     if transport != "stdio":
         import os
         os.environ.setdefault("FASTMCP_PORT", "6090")
+
+    # In server mode: start dashboard + browser automatically
+    if transport == "serve":
+        transport = "sse"
+        os.environ.setdefault("FASTMCP_PORT", "6090")
+        _start_dashboard()
+        asyncio.get_event_loop().run_until_complete(_warmup_browser())
+        print(f"[viewport] MCP server at http://localhost:{os.environ['FASTMCP_PORT']}/sse", file=sys.stderr)
+        print("[viewport] Ready.", file=sys.stderr)
+
     mcp.run(transport=transport)
+
+
+def serve():
+    """All-in-one: MCP server + dashboard + browser. One command to run everything."""
+    sys.argv = [sys.argv[0], "serve"]
+    main()
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ dependencies = [
 [project.scripts]
 viewport-browser = "viewport_browser.server:main"
 viewport-dashboard = "viewport_browser.dashboard:main"
+viewport-serve = "viewport_browser.server:serve"
 
 [build-system]
 requires = ["hatchling"]

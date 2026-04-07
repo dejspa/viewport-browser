@@ -27,21 +27,30 @@ Screenshot (PNG) → Resize to 896×630 → JPEG q55 (~68KB) → Agent sees clea
 
 The only DOM interaction is a single `elementFromPoint()` call at click time. It naturally pierces shadow DOM, finds the nearest interactive element, and snaps to its center. No selectors, no tree walking, no element detection.
 
-## Live monitoring
+## Quick start (all-in-one)
 
-ViewPort includes a live dashboard. Watch your agents browse in real-time from any browser:
+Start everything with a single command — MCP server, dashboard, and browser:
 
 ```bash
-# With uv
-uv run --directory /path/to/viewport-browser viewport-dashboard
+viewport-serve
+```
 
-# Or if installed in venv
+This starts:
+- **MCP server** on port 6090 (SSE for OpenClaw/remote agents)
+- **Dashboard** at http://localhost:6080 (live browser view)
+- **Chrome** with CDP on port 9222
+
+All accessible from other machines on the network via the host IP.
+
+## Live monitoring
+
+The dashboard can also be run standalone:
+
+```bash
 viewport-dashboard
 ```
 
-Opens at **http://localhost:6080** — also accessible from other machines on the network via the host IP.
-
-Uses Chrome DevTools Protocol screencast — works on headless servers, no physical display needed.
+Opens at **http://localhost:6080**. Uses Chrome DevTools Protocol screencast — works on headless servers, no physical display needed.
 
 ## Prerequisites
 
