@@ -153,20 +153,13 @@ class BrowserManager:
 
         self._pw = await async_playwright().start()
 
-        # CDP mode requires Xvfb — skip if not available (e.g. remote/cloud hosts)
-        if cdp_port and not shutil.which("Xvfb"):
-            print("[viewport] Xvfb not found — falling back to headless mode (no dashboard)", file=sys.stderr)
-            cdp_port = None
-
         if cdp_port:
-            # Launch full Chromium (not headless shell) with CDP port, then connect
-            # Playwright to it. The headless shell doesn't support CDP port.
+            # Launch full Chromium with CDP port for dashboard/screencast support.
             port = cdp_port
-            # Find the full Chromium binary (not the headless shell)
             import glob
             candidates = sorted(
                 glob.glob(os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux64/chrome")),
-                reverse=True,  # newest version first
+                reverse=True,
             )
             chrome_path = candidates[0] if candidates else self._pw.chromium.executable_path
             chrome_args = [
@@ -181,22 +174,27 @@ class BrowserManager:
                 f"--window-size={self._vw},{self._vh}",
                 "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             ]
-            # Screencast requires visual rendering — can't use headless.
-            # Use Xvfb (virtual framebuffer) so Chrome renders but no window appears.
             chrome_args.append("about:blank")
 
-            # Start Xvfb on a private display
-            self._xvfb_display = ":99"
-            self._xvfb_proc = subprocess.Popen(
-                ["Xvfb", self._xvfb_display, "-screen", "0",
-                 f"{self._vw}x{self._vh}x24", "-nolisten", "tcp"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            time.sleep(0.5)  # let Xvfb start
-
             env = os.environ.copy()
-            env["DISPLAY"] = self._xvfb_display
+            use_xvfb = shutil.which("Xvfb")
+
+            if use_xvfb:
+                # Xvfb available — use virtual framebuffer (best screencast quality)
+                self._xvfb_display = ":99"
+                self._xvfb_proc = subprocess.Popen(
+                    ["Xvfb", self._xvfb_display, "-screen", "0",
+                     f"{self._vw}x{self._vh}x24", "-nolisten", "tcp"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                time.sleep(0.5)
+                env["DISPLAY"] = self._xvfb_display
+                print(f"[viewport] Using Xvfb on {self._xvfb_display}", file=sys.stderr)
+            else:
+                # No Xvfb — use Chrome's new headless mode (supports CDP + screencast)
+                chrome_args.insert(1, "--headless=new")
+                print("[viewport] No Xvfb — using --headless=new for CDP", file=sys.stderr)
 
             self._chrome_proc = subprocess.Popen(
                 chrome_args,
