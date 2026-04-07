@@ -4,8 +4,7 @@ description: Vision-first web browser — navigate websites, click by coordinate
 version: 1.0.0
 requires:
   env: []
-  bins:
-    - uv
+  bins: []
 ---
 
 # Viewport Browser — Vision-First Web Navigation
@@ -14,15 +13,43 @@ You have access to a browser that lets you navigate websites, click elements, ty
 
 ## Connection
 
-The browser runs as an MCP server. If your runtime supports MCP, connect to it:
+The browser runs as an MCP server. Connect using one of these methods:
+
+### Stdio (Claude Code, Cursor, local agents)
 
 ```json
 {
   "mcpServers": {
     "viewport": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/viewport-browser", "viewport-browser"],
+      "command": "viewport-browser",
       "transport": "stdio"
+    }
+  }
+}
+```
+
+### SSE / HTTP (OpenClaw, remote agents)
+
+Start the server first, then connect:
+
+```bash
+# Start viewport-browser in SSE mode
+viewport-browser sse
+```
+
+```bash
+# OpenClaw
+openclaw mcp set viewport '{"url":"http://localhost:8000/sse"}'
+```
+
+### Stdio with Python (if viewport-browser is not in PATH)
+
+```json
+{
+  "mcpServers": {
+    "viewport": {
+      "command": "python",
+      "args": ["-m", "viewport_browser.server"]
     }
   }
 }
