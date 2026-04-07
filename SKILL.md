@@ -28,8 +28,6 @@ The browser runs as an MCP server. If your runtime supports MCP, connect to it:
 }
 ```
 
-If your runtime does not support MCP, use the REST API at `http://localhost:8080` (see API section below).
-
 ## Tools
 
 | Tool | Parameters | Description |
@@ -95,44 +93,3 @@ Use `get_text` on interesting items.
 - Don't open product detail pages when the info is already visible on the card.
 - If an overlay or popup blocks you, take a new screenshot — it may have been auto-dismissed.
 
-## REST API (for non-MCP runtimes)
-
-If MCP is not available, use HTTP endpoints at `http://localhost:8080`:
-
-```bash
-# Navigate
-curl -X POST http://localhost:8080/navigate -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com"}'
-
-# Screenshot (returns base64 JPEG)
-curl -X POST http://localhost:8080/screenshot
-
-# Click
-curl -X POST http://localhost:8080/click -H "Content-Type: application/json" \
-  -d '{"x": 400, "y": 300}'
-
-# Type text
-curl -X POST http://localhost:8080/type_text -H "Content-Type: application/json" \
-  -d '{"text": "search query", "press_enter": true, "clear_first": true}'
-
-# Scroll
-curl -X POST http://localhost:8080/scroll -H "Content-Type: application/json" \
-  -d '{"direction": "down"}'
-
-# Get text content
-curl -X POST http://localhost:8080/get_text
-
-# Go back
-curl -X POST http://localhost:8080/go_back
-
-# Tab management
-curl -X POST http://localhost:8080/new_tab -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com", "pin": "mysite"}'
-curl -X POST http://localhost:8080/switch_tab -H "Content-Type: application/json" \
-  -d '{"index": 0}'
-curl -X POST http://localhost:8080/list_tabs
-curl -X POST http://localhost:8080/close_tab -H "Content-Type: application/json" \
-  -d '{"index": 1}'
-```
-
-All endpoints return JSON with `screenshot` (base64 JPEG), `text` (feedback/context), and `url` (current URL).
