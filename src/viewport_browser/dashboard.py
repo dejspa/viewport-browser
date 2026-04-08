@@ -205,7 +205,7 @@ function renderModelConfig(){
   for(const m of MODELS){
     h+='<tr class="mrow"><td><input class="mname" value="'+m.name+'" style="background:#22252f;border:1px solid #333;color:#e0e0e0;padding:3px 6px;border-radius:3px;width:100px"></td>';
     h+='<td class="num"><input class="mrate" type="number" step="0.1" value="'+m.rate+'" style="background:#22252f;border:1px solid #333;color:#e0e0e0;padding:3px 6px;border-radius:3px;width:70px;text-align:right"></td>';
-    h+='<td><button onclick="this.closest(\'tr\').remove()" style="background:none;border:none;color:#ef4444;cursor:pointer;font-size:16px">&times;</button></td></tr>';
+    h+='<td><button onclick="this.closest(&quot;tr&quot;).remove()" style="background:none;border:none;color:#ef4444;cursor:pointer;font-size:16px">&times;</button></td></tr>';
   }
   h+='</table>';
   h+='<div style="margin-top:8px"><button onclick="addModelRow()" style="background:#333;color:#fff;border:none;padding:4px 12px;border-radius:3px;cursor:pointer;margin-right:8px">+ Add</button>';
@@ -216,7 +216,7 @@ function addModelRow(){
   const table=document.querySelector('.mrow')?.closest('table');
   if(!table)return;
   const tr=document.createElement('tr');tr.className='mrow';
-  tr.innerHTML='<td><input class="mname" value="" placeholder="Model" style="background:#22252f;border:1px solid #333;color:#e0e0e0;padding:3px 6px;border-radius:3px;width:100px"></td><td class="num"><input class="mrate" type="number" step="0.1" value="1" style="background:#22252f;border:1px solid #333;color:#e0e0e0;padding:3px 6px;border-radius:3px;width:70px;text-align:right"></td><td><button onclick="this.closest(\'tr\').remove()" style="background:none;border:none;color:#ef4444;cursor:pointer;font-size:16px">&times;</button></td>';
+  tr.innerHTML='<td><input class="mname" value="" placeholder="Model" style="background:#22252f;border:1px solid #333;color:#e0e0e0;padding:3px 6px;border-radius:3px;width:100px"></td><td class="num"><input class="mrate" type="number" step="0.1" value="1" style="background:#22252f;border:1px solid #333;color:#e0e0e0;padding:3px 6px;border-radius:3px;width:70px;text-align:right"></td><td><button onclick="this.closest(&quot;tr&quot;).remove()" style="background:none;border:none;color:#ef4444;cursor:pointer;font-size:16px">&times;</button></td>';
   table.appendChild(tr);
 }
 async function openTmod(){
