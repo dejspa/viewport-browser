@@ -154,71 +154,78 @@ class BrowserManager:
         self._pw = await async_playwright().start()
 
         if cdp_port:
-            # Launch full Chromium with CDP port for dashboard/screencast support.
             port = cdp_port
-            import glob
-            candidates = sorted(
-                glob.glob(os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux64/chrome")),
-                reverse=True,
-            )
-            chrome_path = candidates[0] if candidates else self._pw.chromium.executable_path
-            chrome_args = [
-                chrome_path,
-                f"--remote-debugging-port={port}",
-                "--remote-debugging-address=0.0.0.0",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-background-timer-throttling",
-                "--disable-backgrounding-occluded-windows",
-                "--disable-renderer-backgrounding",
-                f"--window-size={self._vw},{self._vh}",
-                "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            ]
-            chrome_args.append("about:blank")
+            import urllib.request
 
-            env = os.environ.copy()
-            use_xvfb = shutil.which("Xvfb")
+            # Check if Chrome is already running on this port (survives MCP reconnects)
+            chrome_running = False
+            try:
+                urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=1)
+                chrome_running = True
+                print(f"[viewport] Reusing existing Chrome on port {port}", file=sys.stderr)
+            except Exception:
+                pass
 
-            if use_xvfb:
-                # Xvfb available — use virtual framebuffer (best screencast quality)
-                self._xvfb_display = ":99"
-                self._xvfb_proc = subprocess.Popen(
-                    ["Xvfb", self._xvfb_display, "-screen", "0",
-                     f"{self._vw}x{self._vh}x24", "-nolisten", "tcp"],
+            if not chrome_running:
+                # Launch new Chrome with CDP port
+                import glob
+                candidates = sorted(
+                    glob.glob(os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux64/chrome")),
+                    reverse=True,
+                )
+                chrome_path = candidates[0] if candidates else self._pw.chromium.executable_path
+                chrome_args = [
+                    chrome_path,
+                    f"--remote-debugging-port={port}",
+                    "--remote-debugging-address=0.0.0.0",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-background-timer-throttling",
+                    "--disable-backgrounding-occluded-windows",
+                    "--disable-renderer-backgrounding",
+                    f"--window-size={self._vw},{self._vh}",
+                    "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                ]
+                chrome_args.append("about:blank")
+
+                env = os.environ.copy()
+                use_xvfb = shutil.which("Xvfb")
+
+                if use_xvfb:
+                    self._xvfb_display = ":99"
+                    self._xvfb_proc = subprocess.Popen(
+                        ["Xvfb", self._xvfb_display, "-screen", "0",
+                         f"{self._vw}x{self._vh}x24", "-nolisten", "tcp"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    time.sleep(0.5)
+                    env["DISPLAY"] = self._xvfb_display
+                    print(f"[viewport] Using Xvfb on {self._xvfb_display}", file=sys.stderr)
+                else:
+                    chrome_args.insert(1, "--headless=new")
+                    print("[viewport] No Xvfb — using --headless=new for CDP", file=sys.stderr)
+
+                self._chrome_proc = subprocess.Popen(
+                    chrome_args,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    env=env,
                 )
-                time.sleep(0.5)
-                env["DISPLAY"] = self._xvfb_display
-                print(f"[viewport] Using Xvfb on {self._xvfb_display}", file=sys.stderr)
-            else:
-                # No Xvfb — use Chrome's new headless mode (supports CDP + screencast)
-                chrome_args.insert(1, "--headless=new")
-                print("[viewport] No Xvfb — using --headless=new for CDP", file=sys.stderr)
-
-            self._chrome_proc = subprocess.Popen(
-                chrome_args,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=env,
-            )
-            # Wait for CDP to be ready
-            import urllib.request
-            for _ in range(30):
-                try:
-                    urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=1)
-                    break
-                except Exception:
-                    time.sleep(0.2)
+                for _ in range(30):
+                    try:
+                        urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=1)
+                        break
+                    except Exception:
+                        time.sleep(0.2)
 
             self._browser = await self._pw.chromium.connect_over_cdp(
                 f"http://localhost:{port}",
                 slow_mo=slow_mo,
             )
-            # Use the default context created by Chrome
             contexts = self._browser.contexts
             if contexts:
                 self._context = contexts[0]
@@ -226,18 +233,22 @@ class BrowserManager:
                 self._context = await self._browser.new_context(
                     viewport={"width": self._vw, "height": self._vh},
                 )
-            # Use existing page or create one
+            # Reattach to all existing pages (preserves tabs across reconnects)
             pages = self._context.pages
-            page = pages[0] if pages else await self._context.new_page()
-            await page.set_viewport_size({"width": self._vw, "height": self._vh})
-            self._pages = [page]
-            self._active = 0
+            if pages:
+                self._pages = list(pages)
+                self._active = len(pages) - 1
+                for page in self._pages:
+                    await page.set_viewport_size({"width": self._vw, "height": self._vh})
+            else:
+                page = await self._context.new_page()
+                await page.set_viewport_size({"width": self._vw, "height": self._vh})
+                self._pages = [page]
+                self._active = 0
 
-            # Auto-close popup tabs (ads, new windows from link clicks)
             self._context.on("page", self._on_new_page)
 
-            print(f"[viewport] Live browser at http://localhost:{port}", file=sys.stderr)
-            print(f"[viewport] Open chrome://inspect and add localhost:{port} to see/interact", file=sys.stderr)
+            print(f"[viewport] Live browser at http://localhost:{port} ({len(self._pages)} tab(s))", file=sys.stderr)
         else:
             # Standard Playwright launch (no remote viewing)
             self._browser = await self._pw.chromium.launch(
