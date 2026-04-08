@@ -447,21 +447,25 @@ async def _warmup_browser():
     await _get_browser()
 
 
+SSE_PORT = 6090
+
+
 def main():
     import sys
     transport = sys.argv[1] if len(sys.argv) > 1 else "stdio"
 
     if transport != "stdio":
-        import os
-        os.environ.setdefault("FASTMCP_PORT", "6090")
+        mcp.settings.port = int(os.environ.get("FASTMCP_PORT", SSE_PORT))
+        mcp.settings.host = "0.0.0.0"
 
     # In server mode: start dashboard + browser automatically
     if transport == "serve":
         transport = "sse"
-        os.environ.setdefault("FASTMCP_PORT", "6090")
+        mcp.settings.port = int(os.environ.get("FASTMCP_PORT", SSE_PORT))
+        mcp.settings.host = "0.0.0.0"
         _start_dashboard()
         asyncio.get_event_loop().run_until_complete(_warmup_browser())
-        print(f"[viewport] MCP server at http://localhost:{os.environ['FASTMCP_PORT']}/sse", file=sys.stderr)
+        print(f"[viewport] MCP server at http://localhost:{mcp.settings.port}/sse", file=sys.stderr)
         print("[viewport] Ready.", file=sys.stderr)
 
     mcp.run(transport=transport)
