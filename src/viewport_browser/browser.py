@@ -136,7 +136,6 @@ class BrowserManager:
         self._active: int = 0
         self._expect_new_page = False
         self._pins: dict[int, str] = {}  # page id -> pin name
-        self._chrome_proc: subprocess.Popen | None = None
         self._vw = viewport_width
         self._vh = viewport_height
         self._cdp_port = cdp_port
@@ -196,7 +195,8 @@ class BrowserManager:
 
                 if use_xvfb:
                     self._xvfb_display = ":99"
-                    self._xvfb_proc = subprocess.Popen(
+                    # Don't store reference — Xvfb must outlive this process
+                    subprocess.Popen(
                         ["Xvfb", self._xvfb_display, "-screen", "0",
                          f"{self._vw}x{self._vh}x24", "-nolisten", "tcp"],
                         stdout=subprocess.DEVNULL,
@@ -210,7 +210,8 @@ class BrowserManager:
                     chrome_args.insert(1, "--headless=new")
                     print("[viewport] No Xvfb — using --headless=new for CDP", file=sys.stderr)
 
-                self._chrome_proc = subprocess.Popen(
+                # Don't store reference — Chrome must outlive this process
+                subprocess.Popen(
                     chrome_args,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
@@ -486,16 +487,9 @@ class BrowserManager:
         return await page.title()
 
     async def close(self) -> None:
+        """Disconnect from browser. Chrome/Xvfb are NOT killed — they persist."""
         if self._browser:
             await self._browser.close()
-        if self._chrome_proc:
-            self._chrome_proc.terminate()
-            self._chrome_proc.wait(timeout=5)
-            self._chrome_proc = None
-        if hasattr(self, '_xvfb_proc') and self._xvfb_proc:
-            self._xvfb_proc.terminate()
-            self._xvfb_proc.wait(timeout=5)
-            self._xvfb_proc = None
         if self._pw:
             await self._pw.stop()
         self._pages = []
