@@ -33,6 +33,7 @@ body{background:#0f1117;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFo
 .tile:hover{border-color:#4a9eff}
 .th{padding:8px 12px;background:#22252f;font-size:13px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;display:flex;align-items:center;justify-content:space-between}
 .th .title{overflow:hidden;text-overflow:ellipsis;flex:1}
+.th .tkn{color:#888;font-size:11px;margin-left:8px;white-space:nowrap}
 .th .close{background:#ef4444;color:#fff;border:none;border-radius:3px;padding:2px 8px;cursor:pointer;font-size:11px;margin-left:8px;opacity:.7}
 .th .close:hover{opacity:1}
 .tb{position:relative;cursor:pointer;background:#000}
@@ -97,15 +98,18 @@ function ct(t){
   ws.onclose=()=>{delete S[t.id];rt(t.id);};
 }
 
+function fmt(n){if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'k';return n.toString();}
+
 function mt(t){
   let el=document.getElementById('t-'+t.id);
   if(el){el.querySelector('.title').textContent=t.title||t.url;return;}
   el=document.createElement('div');el.className='tile';el.id='t-'+t.id;
   const hdr=document.createElement('div');hdr.className='th';
   const title=document.createElement('span');title.className='title';title.textContent=t.title||t.url;
+  const tkn=document.createElement('span');tkn.className='tkn';tkn.id='tk-'+t.id;
   const cbtn=document.createElement('button');cbtn.className='close';cbtn.textContent='Close';
   cbtn.onclick=function(e){e.stopPropagation();ctab(t.id);};
-  hdr.appendChild(title);hdr.appendChild(cbtn);
+  hdr.appendChild(title);hdr.appendChild(tkn);hdr.appendChild(cbtn);
   const body=document.createElement('div');body.className='tb';
   body.onclick=function(){ofs(t.id);};
   const img=document.createElement('img');img.id='i-'+t.id;
@@ -165,6 +169,17 @@ async function poll(){
   for(const t of tabs){ids.add(t.id);mt(t);ct(t);}
   for(const id of Object.keys(S)){if(!ids.has(id))rt(id);}
   ue();
+  // Fetch token stats and match by URL
+  try{
+    const r=await fetch('/api/tokens');
+    const stats=await r.json();
+    const byUrl={};
+    for(const s of stats)byUrl[s.url]=s.tokens;
+    for(const t of tabs){
+      const el=document.getElementById('tk-'+t.id);
+      if(el){const tk=byUrl[t.url];el.textContent=tk?fmt(tk)+' tok':'';}
+    }
+  }catch(e){}
 }
 setInterval(poll,2000);poll();
 </script>
@@ -206,6 +221,17 @@ class _HTTPHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header('Content-Length', str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+        elif self.path == '/api/tokens':
+            try:
+                from .server import get_token_stats
+                data = json.dumps(get_token_stats()).encode()
+            except Exception:
+                data = b'[]'
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
         else:
             self.send_response(404)
             self.end_headers()

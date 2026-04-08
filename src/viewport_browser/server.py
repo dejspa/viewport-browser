@@ -80,6 +80,31 @@ CDP_PORT = 9222
 _browser: BrowserManager | None = None
 _vision: VisionPipeline | None = None
 _memory: PageMemory | None = None
+_page_tokens: dict[int, int] = {}  # id(page) -> cumulative tokens
+
+
+def _track(response: list) -> list:
+    """Estimate tokens in response and record for the active tab."""
+    tokens = 0
+    for part in response:
+        if isinstance(part, MCPImage):
+            tokens += 1500  # ~896x630 JPEG ≈ 1500 Claude vision tokens
+        elif isinstance(part, str):
+            tokens += max(1, len(part) // 4)
+    if _browser and _browser._pages:
+        pid = id(_browser._pages[_browser._active])
+        _page_tokens[pid] = _page_tokens.get(pid, 0) + tokens
+    return response
+
+
+def get_token_stats() -> list[dict]:
+    """Returns [{url, tokens}, ...] for each tab. Used by dashboard."""
+    if not _browser or not _browser._pages:
+        return []
+    return [
+        {"url": page.url, "tokens": _page_tokens.get(id(page), 0)}
+        for page in _browser._pages
+    ]
 
 
 async def _get_browser() -> BrowserManager:
@@ -175,7 +200,7 @@ async def navigate(url: str) -> list:
     tab_info = " | ".join(f"[{t['index']}{'*' if t['active'] else ''}]{' 📌'+t['pin'] if t['pin'] else ''} {t['url'][:30]}" for t in tabs)
     text = f"{status}\n{context}\n\nURL: {browser.current_url}\nTitle: {title}\nTabs: {tab_info}"
     result.append(text)
-    return result
+    return _track(result)
 
 
 @mcp.tool()
@@ -209,9 +234,9 @@ async def click(x: int, y: int) -> list:
         desc = f"No interactive element at ({x}, {y}) — raw click performed"
 
     img, crop, context, diff_ratio = await _capture()
-    return _build_response(img, crop, context,
+    return _track(_build_response(img, crop, context,
                            f"{desc}\nURL: {browser.current_url}",
-                           diff_ratio)
+                           diff_ratio))
 
 
 @mcp.tool()
@@ -225,12 +250,12 @@ async def type_text(text: str, press_enter: bool = False, clear_first: bool = Fa
     if press_enter:
         # Pressing enter may navigate — return screenshot
         img, crop, context, diff_ratio = await _capture()
-        return _build_response(img, crop, context,
+        return _track(_build_response(img, crop, context,
                                f"Typed: '{text}' + Enter | URL: {browser.current_url}",
-                               diff_ratio)
+                               diff_ratio))
 
     # No enter — page barely changed. Text-only response saves ~800 tokens.
-    return [f"Typed: '{text}' into focused element.\nURL: {browser.current_url}\n\nUse screenshot() to see the current page if needed."]
+    return _track([f"Typed: '{text}' into focused element.\nURL: {browser.current_url}\n\nUse screenshot() to see the current page if needed."])
 
 
 @mcp.tool()
@@ -243,11 +268,11 @@ async def scroll(direction: str = "down") -> list:
 
     if diff_ratio < 0.02:
         # Nothing new appeared — probably at top/bottom of page
-        return [f"Scrolled {direction} — no new content visible (may have reached the {'bottom' if direction == 'down' else 'top'}).\nURL: {browser.current_url}"]
+        return _track([f"Scrolled {direction} — no new content visible (may have reached the {'bottom' if direction == 'down' else 'top'}).\nURL: {browser.current_url}"])
 
-    return _build_response(img, crop, context,
+    return _track(_build_response(img, crop, context,
                            f"Scrolled {direction} | URL: {browser.current_url}",
-                           diff_ratio)
+                           diff_ratio))
 
 
 @mcp.tool()
@@ -257,7 +282,9 @@ async def get_text() -> str:
     Returns plain text with markdown headings — much faster than reading from screenshots."""
     browser = await _get_browser()
     text = await browser.get_page_text()
-    return f"URL: {browser.current_url}\n\n{text}"
+    result = f"URL: {browser.current_url}\n\n{text}"
+    _track([result])
+    return result
 
 
 @mcp.tool()
@@ -269,7 +296,7 @@ async def go_back() -> list:
     # Always full screenshot for navigation
     result = [MCPImage(data=img, format="jpeg")]
     result.append(f"{context}\n\nWent back | URL: {browser.current_url}")
-    return result
+    return _track(result)
 
 
 @mcp.tool()
@@ -280,7 +307,7 @@ async def screenshot() -> list:
     # Always full screenshot when explicitly requested
     result = [MCPImage(data=img, format="jpeg")]
     result.append(f"{context}\n\nURL: {browser.current_url}")
-    return result
+    return _track(result)
 
 
 @mcp.tool()
@@ -295,7 +322,7 @@ async def new_tab(url: str = "about:blank", pin: str = "") -> list:
     result = [MCPImage(data=img, format="jpeg")]
     pin_msg = f" (pinned as '{pin}')" if pin else ""
     result.append(f"{context}\n\nOpened tab {index}{pin_msg} | URL: {browser.current_url}\n\nAll tabs:\n{tab_info}")
-    return result
+    return _track(result)
 
 
 @mcp.tool()
@@ -306,7 +333,7 @@ async def switch_tab(index: int) -> list:
     img, crop, context, _ = await _capture()
     result = [MCPImage(data=img, format="jpeg")]
     result.append(f"Switched to tab {index} | URL: {browser.current_url}")
-    return result
+    return _track(result)
 
 
 @mcp.tool()
@@ -315,7 +342,9 @@ async def list_tabs() -> str:
     browser = await _get_browser()
     tabs = browser.list_tabs()
     lines = [f"[{t['index']}] {'→ ' if t['active'] else '  '}{t['url']}" for t in tabs]
-    return f"{len(tabs)} open tabs:\n" + "\n".join(lines)
+    result = f"{len(tabs)} open tabs:\n" + "\n".join(lines)
+    _track([result])
+    return result
 
 
 @mcp.tool()
@@ -330,7 +359,7 @@ async def close_tab(index: int) -> list:
     tab_info = "\n".join(f"  [{t['index']}] {'📌'+t['pin']+' ' if t['pin'] else ''}{'→ ' if t['active'] else '  '}{t['url']}" for t in tabs)
     result = [MCPImage(data=img, format="jpeg")]
     result.append(f"Closed tab {index}\n\nAll tabs:\n{tab_info}")
-    return result
+    return _track(result)
 
 
 def _start_dashboard():
