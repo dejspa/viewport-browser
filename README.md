@@ -113,11 +113,71 @@ viewport-browser sse  # listens on port 6090
 openclaw mcp set viewport '{"url":"http://localhost:6090/sse"}'
 ```
 
+### Paperclip (multi-agent)
+
+Each agent gets its own browser with isolated cookies/sessions via separate CDP ports.
+
+**1. Create a working directory per agent with its own `.mcp.json`:**
+
+```bash
+mkdir -p /home/user/agents/dejan
+cat > /home/user/agents/dejan/.mcp.json << 'EOF'
+{
+  "mcpServers": {
+    "viewport": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/viewport-browser", "viewport-browser"],
+      "env": {"VIEWPORT_CDP_PORT": "9222", "VIEWPORT_SESSION": "dejan"}
+    }
+  }
+}
+EOF
+```
+
+**2. Configure the agent in Paperclip with `cwd` pointing to its directory:**
+
+```yaml
+name: dejan
+adapter: claude_local
+config:
+  cwd: /home/user/agents/dejan
+  model: sonnet
+  dangerouslySkipPermissions: true
+```
+
+**3. For a second agent, use a different CDP port:**
+
+```bash
+mkdir -p /home/user/agents/anna
+cat > /home/user/agents/anna/.mcp.json << 'EOF'
+{
+  "mcpServers": {
+    "viewport": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/viewport-browser", "viewport-browser"],
+      "env": {"VIEWPORT_CDP_PORT": "9223", "VIEWPORT_SESSION": "anna"}
+    }
+  }
+}
+EOF
+```
+
+Each agent gets a completely isolated Chrome instance. Tabs and login sessions persist across heartbeats — Chrome runs independently of the agent process.
+
 ### Other platforms
 
-See [SKILL.md](SKILL.md) for integration with Paperclip, Codex CLI, Gemini CLI, and other agent harnesses.
+See [SKILL.md](SKILL.md) for integration with Codex CLI, Gemini CLI, and other agent harnesses.
 
-Works with any MCP-compatible agent. The 11 tools appear automatically after connecting.
+Works with any MCP-compatible agent. The 12 tools appear automatically after connecting.
+
+## Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VIEWPORT_CDP_PORT` | `9222` | Chrome DevTools Protocol port. Use different ports for multi-agent isolation. |
+| `VIEWPORT_SESSION` | `default` | Session name for token tracking. Keeps per-agent stats separate. |
+| `VIEWPORT_MODEL` | `unknown` | Model name for cost tracking. Also settable via `set_model()` tool. |
+| `FASTMCP_PORT` | `6090` | Port for SSE/HTTP transport (non-stdio mode). |
 
 ## Tools
 
@@ -130,6 +190,11 @@ Works with any MCP-compatible agent. The 11 tools appear automatically after con
 | `get_text()` | Extract page text (articles, prices, product details) |
 | `go_back()` | Browser back |
 | `screenshot()` | Fresh screenshot |
+| `set_model(model)` | Set model name for cost tracking |
+| `new_tab(url, pin)` | Open a new tab, optionally pin it |
+| `switch_tab(index)` | Switch to a tab by index |
+| `list_tabs()` | Show all open tabs |
+| `close_tab(index)` | Close a tab |
 
 ## Smart token optimization
 

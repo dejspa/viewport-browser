@@ -76,14 +76,15 @@ RULES:
 )
 
 # Shared state — lazily initialized, persists across tool calls
-CDP_PORT = 9222
+CDP_PORT = int(os.environ.get("VIEWPORT_CDP_PORT", "9222"))
 
 _browser: BrowserManager | None = None
 _vision: VisionPipeline | None = None
 _memory: PageMemory | None = None
 _page_tokens: dict[int, int] = {}  # id(page) -> cumulative tokens
 _current_model: str = os.environ.get("VIEWPORT_MODEL", "unknown")
-_TOKEN_FILE = "/tmp/viewport-tokens.json"
+_session = os.environ.get("VIEWPORT_SESSION", "default")
+_TOKEN_FILE = f"/tmp/viewport-tokens-{_session}.json"
 _TOKEN_LOG = os.path.expanduser("~/.viewport/token-log.jsonl")
 
 
@@ -129,6 +130,7 @@ def _append_token_log(url: str, tokens: int):
                 "url": url,
                 "tokens": tokens,
                 "model": _current_model,
+                "session": _session,
             }) + "\n")
     except Exception:
         pass
