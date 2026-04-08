@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import http.server
 import json
+import os
 import sys
 import threading
 import urllib.request
@@ -33,11 +34,23 @@ body{background:#0f1117;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFo
 .tile:hover{border-color:#4a9eff}
 .th{padding:8px 12px;background:#22252f;font-size:13px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;display:flex;align-items:center;justify-content:space-between}
 .th .title{overflow:hidden;text-overflow:ellipsis;flex:1}
+.th .hbtn{background:#333;color:#aaa;border:none;border-radius:3px;padding:2px 6px;cursor:pointer;font-size:10px;margin-left:6px}
+.th .hbtn:hover{background:#4a9eff;color:#fff}
 .th .tkn{color:#4ade80;font-size:11px;margin-left:8px;white-space:nowrap;cursor:pointer}
 .th .tkn:hover{color:#fff}
 .tmod{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;display:none;align-items:center;justify-content:center}
 .tmod.on{display:flex}
 .tmod .tbox{background:#1a1d27;border-radius:12px;padding:24px;width:520px;max-height:80vh;overflow-y:auto;border:1px solid #2a2d37}
+.hmod{position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:200;display:none;flex-direction:column}
+.hmod.on{display:flex}
+.hmod .hbar{background:#1a1d27;padding:8px 16px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #2a2d37}
+.hmod .hbar button{background:#333;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer}
+.hmod .hbar button:hover{background:#4a9eff}
+.hmod .hgrid{flex:1;overflow-y:auto;padding:16px;display:flex;flex-wrap:wrap;gap:12px;align-content:flex-start}
+.hmod .hitem{background:#22252f;border-radius:6px;overflow:hidden;width:280px;border:1px solid #2a2d37}
+.hmod .hitem img{width:100%;display:block;cursor:pointer}
+.hmod .hitem img:hover{opacity:.8}
+.hmod .hmeta{padding:4px 8px;font-size:11px;color:#888;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .tmod h2{font-size:18px;margin-bottom:16px;display:flex;justify-content:space-between;align-items:center}
 .tmod .xbtn{background:none;border:none;color:#888;font-size:20px;cursor:pointer}
 .tmod .xbtn:hover{color:#fff}
@@ -75,6 +88,10 @@ body{background:#0f1117;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFo
     <h2>Token Usage <button class="xbtn" onclick="closeTmod()">&times;</button></h2>
     <div id="tmod-content"></div>
   </div>
+</div>
+<div class="hmod" id="hmod">
+  <div class="hbar"><div id="hmod-title">Screenshot History</div><button onclick="closeHmod()">Close (Esc)</button></div>
+  <div class="hgrid" id="hmod-grid"></div>
 </div>
 <div class="fs" id="fs">
   <div class="bar"><div><span id="fst"></span><span class="badge">LIVE</span></div><button onclick="xfs()">Close (Esc)</button></div>
@@ -142,9 +159,11 @@ function mt(t){
   const title=document.createElement('span');title.className='title';title.textContent=t.title||t.url;
   const tkn=document.createElement('span');tkn.className='tkn';tkn.id='tk-'+t.id;
   tkn.onclick=function(e){e.stopPropagation();openTmod();};
+  const hbtn=document.createElement('button');hbtn.className='hbtn';hbtn.textContent='History';
+  hbtn.onclick=function(e){e.stopPropagation();openHmod(t.url,t.title);};
   const cbtn=document.createElement('button');cbtn.className='close';cbtn.textContent='Close';
   cbtn.onclick=function(e){e.stopPropagation();ctab(t.id);};
-  hdr.appendChild(title);hdr.appendChild(tkn);hdr.appendChild(cbtn);
+  hdr.appendChild(title);hdr.appendChild(tkn);hdr.appendChild(hbtn);hdr.appendChild(cbtn);
   const body=document.createElement('div');body.className='tb';
   body.onclick=function(){ofs(t.id);};
   const img=document.createElement('img');img.id='i-'+t.id;
@@ -197,6 +216,39 @@ function ctab(id){
   });
 }
 function ue(){document.getElementById('mt').style.display=document.getElementById('grid').children.length?'none':'block';}
+
+function closeHmod(){document.getElementById('hmod').classList.remove('on');}
+async function openHmod(url,title){
+  document.getElementById('hmod').classList.add('on');
+  document.getElementById('hmod-title').textContent='History: '+(title||url);
+  const grid=document.getElementById('hmod-grid');
+  grid.innerHTML='Loading...';
+  try{
+    const r=await fetch('/api/screenshot-history');
+    const entries=await r.json();
+    // Filter by URL domain
+    const domain=url.replace(/https?:\/\//,'').split('/')[0].replace('www.','');
+    const filtered=entries.filter(e=>{
+      const d=e.url.replace(/https?:\/\//,'').split('/')[0].replace('www.','');
+      return d===domain;
+    }).sort((a,b)=>b.ts.localeCompare(a.ts));
+    if(!filtered.length){grid.innerHTML='<div style="color:#666;padding:40px">No screenshots recorded yet for this tab.</div>';return;}
+    grid.innerHTML='';
+    for(const e of filtered){
+      const item=document.createElement('div');item.className='hitem';
+      const img=document.createElement('img');
+      img.src='/screenshots/'+e._dir+'/'+e.file;
+      img.loading='lazy';
+      img.onclick=function(){window.open(img.src,'_blank');};
+      const meta=document.createElement('div');meta.className='hmeta';
+      const t=new Date(e.ts);
+      meta.textContent=t.toLocaleString()+' — '+e.url.slice(0,60);
+      item.appendChild(img);item.appendChild(meta);
+      grid.appendChild(item);
+    }
+  }catch(ex){grid.innerHTML='Failed to load history.';}
+}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeHmod();});
 
 
 function closeTmod(){document.getElementById('tmod').classList.remove('on');}
@@ -399,6 +451,47 @@ class _HTTPHandler(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Length', str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+        elif self.path == '/api/screenshot-history':
+            import glob as g
+            entries = []
+            for hist_dir in sorted(g.glob("/tmp/viewport-history-*")):
+                idx = os.path.join(hist_dir, "index.jsonl")
+                try:
+                    with open(idx) as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                e = json.loads(line)
+                                e["_dir"] = os.path.basename(hist_dir)
+                                entries.append(e)
+                except Exception:
+                    pass
+            data = json.dumps(entries).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif self.path.startswith('/screenshots/'):
+            # Serve screenshot files: /screenshots/{dir}/{filename}
+            parts = self.path.split('/')
+            if len(parts) >= 4:
+                filepath = os.path.join("/tmp", parts[2], parts[3])
+                try:
+                    with open(filepath, "rb") as f:
+                        data = f.read()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'image/jpeg')
+                    self.send_header('Content-Length', str(len(data)))
+                    self.send_header('Cache-Control', 'public, max-age=86400')
+                    self.end_headers()
+                    self.wfile.write(data)
+                except Exception:
+                    self.send_response(404)
+                    self.end_headers()
+            else:
+                self.send_response(404)
+                self.end_headers()
         else:
             self.send_response(404)
             self.end_headers()

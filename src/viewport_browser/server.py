@@ -171,6 +171,8 @@ def _get_memory() -> PageMemory:
     return _memory
 
 
+_HISTORY_DIR = f"/tmp/viewport-history-{_session}"
+
 async def _capture() -> tuple[bytes, bytes | None, str, float]:
     """Take screenshot, process it.
 
@@ -188,7 +190,34 @@ async def _capture() -> tuple[bytes, bytes | None, str, float]:
     title = await browser.get_page_title()
     context = memory.update(url, title, diff_ratio)
 
+    # Save screenshot to history
+    _save_screenshot(jpeg_bytes, url, title)
+
     return jpeg_bytes, crop_jpeg, context, diff_ratio
+
+
+def _save_screenshot(jpeg_bytes: bytes, url: str, title: str):
+    """Save screenshot to disk for history browsing."""
+    import json
+    from datetime import datetime, timezone
+    try:
+        os.makedirs(_HISTORY_DIR, exist_ok=True)
+        ts = datetime.now(timezone.utc)
+        filename = f"{ts.strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+        filepath = os.path.join(_HISTORY_DIR, filename)
+        with open(filepath, "wb") as f:
+            f.write(jpeg_bytes)
+        # Append to index
+        with open(os.path.join(_HISTORY_DIR, "index.jsonl"), "a") as f:
+            f.write(json.dumps({
+                "ts": ts.isoformat(),
+                "file": filename,
+                "url": url,
+                "title": title,
+                "session": _session,
+            }) + "\n")
+    except Exception:
+        pass
 
 
 def _build_response(img: bytes, crop: bytes | None, context: str,
