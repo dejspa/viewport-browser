@@ -184,7 +184,41 @@ function ctab(id){
 }
 function ue(){document.getElementById('mt').style.display=document.getElementById('grid').children.length?'none':'block';}
 
+let MODELS=[{name:'Haiku',rate:0.8},{name:'Sonnet',rate:3},{name:'Opus',rate:15}];
+try{const s=localStorage.getItem('vp-models');if(s)MODELS=JSON.parse(s);}catch(e){}
+
 function closeTmod(){document.getElementById('tmod').classList.remove('on');}
+function saveModels(){
+  const rows=document.querySelectorAll('.mrow');
+  MODELS=[];
+  rows.forEach(r=>{
+    const n=r.querySelector('.mname').value.trim();
+    const v=parseFloat(r.querySelector('.mrate').value);
+    if(n&&v>0)MODELS.push({name:n,rate:v});
+  });
+  localStorage.setItem('vp-models',JSON.stringify(MODELS));
+  openTmod();
+}
+function renderModelConfig(){
+  let h='<div class="section">Model Pricing ($/M input tokens)</div>';
+  h+='<table>';
+  for(const m of MODELS){
+    h+='<tr class="mrow"><td><input class="mname" value="'+m.name+'" style="background:#22252f;border:1px solid #333;color:#e0e0e0;padding:3px 6px;border-radius:3px;width:100px"></td>';
+    h+='<td class="num"><input class="mrate" type="number" step="0.1" value="'+m.rate+'" style="background:#22252f;border:1px solid #333;color:#e0e0e0;padding:3px 6px;border-radius:3px;width:70px;text-align:right"></td>';
+    h+='<td><button onclick="this.closest(\'tr\').remove()" style="background:none;border:none;color:#ef4444;cursor:pointer;font-size:16px">&times;</button></td></tr>';
+  }
+  h+='</table>';
+  h+='<div style="margin-top:8px"><button onclick="addModelRow()" style="background:#333;color:#fff;border:none;padding:4px 12px;border-radius:3px;cursor:pointer;margin-right:8px">+ Add</button>';
+  h+='<button onclick="saveModels()" style="background:#4ade80;color:#000;border:none;padding:4px 12px;border-radius:3px;cursor:pointer;font-weight:600">Save</button></div>';
+  return h;
+}
+function addModelRow(){
+  const table=document.querySelector('.mrow')?.closest('table');
+  if(!table)return;
+  const tr=document.createElement('tr');tr.className='mrow';
+  tr.innerHTML='<td><input class="mname" value="" placeholder="Model" style="background:#22252f;border:1px solid #333;color:#e0e0e0;padding:3px 6px;border-radius:3px;width:100px"></td><td class="num"><input class="mrate" type="number" step="0.1" value="1" style="background:#22252f;border:1px solid #333;color:#e0e0e0;padding:3px 6px;border-radius:3px;width:70px;text-align:right"></td><td><button onclick="this.closest(\'tr\').remove()" style="background:none;border:none;color:#ef4444;cursor:pointer;font-size:16px">&times;</button></td>';
+  table.appendChild(tr);
+}
 async function openTmod(){
   document.getElementById('tmod').classList.add('on');
   const el=document.getElementById('tmod-content');
@@ -209,26 +243,30 @@ async function openTmod(){
     }
     const cost=(tok,rate)=>'$'+(tok*rate/1e6).toFixed(4);
     let h='<div class="section">Summary</div><table>';
-    h+='<tr><th>Period</th><th class="num">Tokens</th><th class="num">Haiku</th><th class="num">Sonnet</th><th class="num">Opus</th></tr>';
-    h+='<tr><td>Today</td><td class="num total">'+fmt(todayTok)+'</td><td class="num cost">'+cost(todayTok,0.8)+'</td><td class="num cost">'+cost(todayTok,3)+'</td><td class="num cost">'+cost(todayTok,15)+'</td></tr>';
-    h+='<tr><td>This month</td><td class="num total">'+fmt(monthTok)+'</td><td class="num cost">'+cost(monthTok,0.8)+'</td><td class="num cost">'+cost(monthTok,3)+'</td><td class="num cost">'+cost(monthTok,15)+'</td></tr>';
-    h+='<tr><td>All time</td><td class="num total">'+fmt(allTok)+'</td><td class="num cost">'+cost(allTok,0.8)+'</td><td class="num cost">'+cost(allTok,3)+'</td><td class="num cost">'+cost(allTok,15)+'</td></tr>';
+    h+='<tr><th>Period</th><th class="num">Tokens</th>';
+    for(const m of MODELS)h+='<th class="num">'+m.name+'</th>';
+    h+='</tr>';
+    for(const[label,tok]of[['Today',todayTok],['This month',monthTok],['All time',allTok]]){
+      h+='<tr><td>'+label+'</td><td class="num total">'+fmt(tok)+'</td>';
+      for(const m of MODELS)h+='<td class="num cost">'+cost(tok,m.rate)+'</td>';
+      h+='</tr>';
+    }
     h+='</table>';
     h+='<div class="section">By site (this month)</div><table>';
-    h+='<tr><th>Site</th><th class="num">Tokens</th><th class="num">Sonnet cost</th></tr>';
+    h+='<tr><th>Site</th><th class="num">Tokens</th><th class="num">Cost ('+MODELS[0]?.name+')</th></tr>';
     const sorted=Object.entries(byUrl).sort((a,b)=>b[1]-a[1]);
     for(const[site,tok]of sorted.slice(0,15)){
-      h+='<tr><td>'+site+'</td><td class="num">'+fmt(tok)+'</td><td class="num cost">'+cost(tok,3)+'</td></tr>';
+      h+='<tr><td>'+site+'</td><td class="num">'+fmt(tok)+'</td><td class="num cost">'+cost(tok,MODELS[0]?.rate||3)+'</td></tr>';
     }
     h+='</table>';
     h+='<div class="section">Daily (last 14 days)</div><table>';
-    h+='<tr><th>Date</th><th class="num">Tokens</th><th class="num">Sonnet cost</th></tr>';
+    h+='<tr><th>Date</th><th class="num">Tokens</th><th class="num">Cost ('+MODELS[0]?.name+')</th></tr>';
     const days=Object.entries(byDay).sort((a,b)=>b[0].localeCompare(a[0]));
     for(const[day,tok]of days.slice(0,14)){
-      h+='<tr><td>'+day+'</td><td class="num">'+fmt(tok)+'</td><td class="num cost">'+cost(tok,3)+'</td></tr>';
+      h+='<tr><td>'+day+'</td><td class="num">'+fmt(tok)+'</td><td class="num cost">'+cost(tok,MODELS[0]?.rate||3)+'</td></tr>';
     }
     h+='</table>';
-    h+='<div style="color:#555;font-size:11px;margin-top:12px">Cost = estimated vision input tokens × model rate. Haiku $0.80/M · Sonnet $3/M · Opus $15/M</div>';
+    h+=renderModelConfig();
     el.innerHTML=h;
   }catch(e){el.innerHTML='Failed to load token history.';}
 }
