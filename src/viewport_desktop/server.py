@@ -1,0 +1,247 @@
+"""MCP server — vision-first desktop controller.
+
+Pure vision, no OS APIs. The AI sees the screen and uses mouse/keyboard.
+Just like a human sitting at the computer.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+
+from mcp.server.fastmcp import FastMCP, Image as MCPImage
+
+from .desktop import DesktopController
+from .vision import VisionPipeline
+
+mcp = FastMCP(
+    "desktop",
+    instructions="""\
+Vision-first desktop controller. Full computer control through screenshots and input simulation.
+No OS APIs — pure vision, just like a human.
+
+TOOLS:
+- screenshot() — see the current state of the desktop
+- click(x, y) — left-click at coordinates
+- double_click(x, y) — double-click at coordinates
+- right_click(x, y) — right-click for context menu
+- type_text(text, press_enter) — type text on the keyboard
+- key(combo) — press keys: "Return", "ctrl+c", "alt+Tab", "super", "ctrl+shift+t"
+- scroll(direction, x, y) — scroll up/down at position
+- drag(x1, y1, x2, y2) — click-drag from one point to another
+
+HOW IT WORKS:
+- You see a screenshot of the desktop (~896px wide).
+- Tick marks along the top and left edges at 200px intervals help you estimate coordinates.
+- Click/type/key commands control the real mouse and keyboard.
+- After each action, you get a new screenshot showing the result.
+- There is NO snap-to-element. Your coordinates must be accurate.
+- There is NO get_text. Read text from the screenshot.
+
+STRATEGY GUIDE:
+1. OPEN AN APP: key("super") → screenshot → type_text("firefox") → key("Return") → screenshot
+2. CLICK A BUTTON: Look at screenshot, estimate (x, y) of the button, click(x, y)
+3. TYPE IN A FIELD: click the field first to focus it, then type_text("hello")
+4. NAVIGATE MENUS: click menu → screenshot → click menu item
+5. SWITCH WINDOWS: key("alt+Tab") → screenshot
+6. FILE MANAGER: key("super") → type_text("files") → key("Return") → screenshot
+
+RULES:
+- Always start with screenshot() to see the current desktop state.
+- Take a screenshot after actions to confirm the result.
+- Be precise with coordinates — there is no auto-snap.
+- Use key("super") to open the app launcher/start menu.
+- Use key("alt+F4") to close windows.
+- Use key("ctrl+c")/key("ctrl+v") for copy/paste.
+""",
+)
+
+_desktop: DesktopController | None = None
+_vision: VisionPipeline | None = None
+
+
+def _get_desktop() -> DesktopController:
+    global _desktop
+    if _desktop is None:
+        _desktop = DesktopController()
+    return _desktop
+
+
+def _get_vision() -> VisionPipeline:
+    global _vision
+    if _vision is None:
+        _vision = VisionPipeline()
+    return _vision
+
+
+async def _capture() -> tuple[bytes, bytes | None, float]:
+    """Take screenshot, process it.
+
+    Returns (jpeg_bytes, crop_jpeg_or_none, diff_ratio).
+    """
+    desktop = _get_desktop()
+    vision = _get_vision()
+
+    png = await desktop.screenshot()
+    diff_ratio, crop_jpeg = vision.get_change_info(png)
+    jpeg_bytes = vision.process(png)
+
+    return jpeg_bytes, crop_jpeg, diff_ratio
+
+
+def _scale_coords(x: int, y: int) -> tuple[int, int]:
+    """Scale from screenshot coordinates to actual screen coordinates."""
+    desktop = _get_desktop()
+    vision = _get_vision()
+
+    sw, sh = desktop.screen_size
+    if sw == 0 or sh == 0:
+        # Screen size unknown yet — take a screenshot first
+        return x, y
+
+    sx = sw / vision.actual_width
+    sy = sh / vision.actual_height
+    return int(x * sx), int(y * sy)
+
+
+def _build_response(
+    img: bytes, crop: bytes | None, diff_ratio: float, text: str = ""
+) -> list:
+    """Build response — smart about what images to include."""
+    if diff_ratio < 0.02:
+        return [text or "Screen unchanged"]
+
+    if crop and 0.05 < diff_ratio < 0.3:
+        result = [MCPImage(data=crop, format="jpeg")]
+        if text:
+            result.append(
+                text + "\n[Showing changed area. Use screenshot() for full screen.]"
+            )
+        return result
+
+    result = [MCPImage(data=img, format="jpeg")]
+    if text:
+        result.append(text)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def screenshot() -> list:
+    """Take a screenshot of the entire desktop. Always call this first to see what's on screen."""
+    desktop = _get_desktop()
+    err = desktop.check_tools()
+    if err:
+        return [f"ERROR: {err}\n\nInstall with: sudo apt install scrot xdotool"]
+
+    img, _, _ = await _capture()
+    return [MCPImage(data=img, format="jpeg")]
+
+
+@mcp.tool()
+async def click(x: int, y: int) -> list:
+    """Left-click at (x, y) on the screenshot.
+    The screenshot is ~896px wide. Tick marks at 200px intervals help you estimate position.
+    There is no auto-snap — aim for the center of what you want to click."""
+    desktop = _get_desktop()
+    sx, sy = _scale_coords(x, y)
+    await desktop.click(sx, sy)
+    await asyncio.sleep(0.3)
+    img, crop, diff = await _capture()
+    return _build_response(img, crop, diff, f"Clicked ({x}, {y})")
+
+
+@mcp.tool()
+async def double_click(x: int, y: int) -> list:
+    """Double-click at (x, y). Use for opening files, selecting words, etc."""
+    desktop = _get_desktop()
+    sx, sy = _scale_coords(x, y)
+    await desktop.double_click(sx, sy)
+    await asyncio.sleep(0.3)
+    img, crop, diff = await _capture()
+    return _build_response(img, crop, diff, f"Double-clicked ({x}, {y})")
+
+
+@mcp.tool()
+async def right_click(x: int, y: int) -> list:
+    """Right-click at (x, y). Opens context menus."""
+    desktop = _get_desktop()
+    sx, sy = _scale_coords(x, y)
+    await desktop.right_click(sx, sy)
+    await asyncio.sleep(0.3)
+    img, crop, diff = await _capture()
+    return _build_response(img, crop, diff, f"Right-clicked ({x}, {y})")
+
+
+@mcp.tool()
+async def type_text(text: str, press_enter: bool = False) -> list:
+    """Type text on the keyboard. Set press_enter=true to press Enter after typing.
+    Click a text field first to focus it before typing."""
+    desktop = _get_desktop()
+    await desktop.type_text(text)
+    if press_enter:
+        await asyncio.sleep(0.05)
+        await desktop.key("Return")
+        await asyncio.sleep(0.5)
+        img, crop, diff = await _capture()
+        return _build_response(img, crop, diff, f"Typed: '{text}' + Enter")
+    return [f"Typed: '{text}'"]
+
+
+@mcp.tool()
+async def key(combo: str) -> list:
+    """Press a key or key combination.
+    Examples: 'Return', 'Escape', 'Tab', 'BackSpace', 'Delete',
+              'ctrl+c', 'ctrl+v', 'ctrl+z', 'alt+Tab', 'alt+F4',
+              'super' (opens app launcher), 'ctrl+shift+t', 'space'"""
+    desktop = _get_desktop()
+    await desktop.key(combo)
+    await asyncio.sleep(0.5)
+    img, crop, diff = await _capture()
+    return _build_response(img, crop, diff, f"Pressed: {combo}")
+
+
+@mcp.tool()
+async def scroll(direction: str = "down", x: int = 0, y: int = 0) -> list:
+    """Scroll up or down. Optionally at a specific position (x, y).
+    If x and y are 0, scrolls at current mouse position."""
+    desktop = _get_desktop()
+    if x > 0 or y > 0:
+        sx, sy = _scale_coords(x, y)
+    else:
+        sx, sy = 0, 0
+    await desktop.scroll(direction, sx, sy)
+    await asyncio.sleep(0.3)
+    img, crop, diff = await _capture()
+    if diff < 0.02:
+        return [f"Scrolled {direction} — no change visible"]
+    return _build_response(img, crop, diff, f"Scrolled {direction}")
+
+
+@mcp.tool()
+async def drag(x1: int, y1: int, x2: int, y2: int) -> list:
+    """Drag from (x1, y1) to (x2, y2). For moving windows, selecting text, resizing, etc."""
+    desktop = _get_desktop()
+    sx1, sy1 = _scale_coords(x1, y1)
+    sx2, sy2 = _scale_coords(x2, y2)
+    await desktop.drag(sx1, sy1, sx2, sy2)
+    await asyncio.sleep(0.3)
+    img, crop, diff = await _capture()
+    return _build_response(img, crop, diff, f"Dragged ({x1},{y1}) -> ({x2},{y2})")
+
+
+def main():
+    transport = sys.argv[1] if len(sys.argv) > 1 else "stdio"
+    if transport != "stdio":
+        mcp.settings.port = int(os.environ.get("FASTMCP_PORT", "6091"))
+        mcp.settings.host = "0.0.0.0"
+    mcp.run(transport=transport)
+
+
+if __name__ == "__main__":
+    main()
