@@ -7,8 +7,11 @@ Just like a human sitting at the computer.
 from __future__ import annotations
 
 import asyncio
+import json
+import math
 import os
 import sys
+from datetime import datetime, timezone
 
 from mcp.server.fastmcp import FastMCP, Image as MCPImage
 
@@ -23,6 +26,7 @@ No OS APIs — pure vision, just like a human.
 
 TOOLS:
 - screenshot() — see the full desktop
+- click_text(text, near, index) — click visible text on screen using OCR (no coordinates needed!)
 - move(x, y) — move mouse and see zoomed view around cursor (for precise targeting)
 - click(x, y) — quick click at coordinates (or omit x,y to click at current position after move)
 - double_click(x, y) — double-click (or omit x,y for current position)
@@ -48,13 +52,20 @@ FAST MODE — skip move() when precision isn't needed:
 - click(x, y) → type_text("hello") → key("Return") → screenshot()
 - Use this for large buttons, text fields, or known positions.
 
+SMART CLICKING — use click_text() for text targets:
+- click_text("Sign in") → finds and clicks "Sign in" button
+- click_text("Close", near="Chrome") → clicks Close nearest to Chrome
+- Best for: buttons, links, menu items, labels — anything with readable text.
+- Falls back to numbered annotation if multiple matches.
+
 STRATEGY GUIDE:
 1. OPEN AN APP: key("super") → type_text("firefox", press_enter=true) → screenshot()
 2. PRECISE CLICK: move(x, y) → verify target in zoom → click() → screenshot()
 3. QUICK CLICK: click(x, y) → screenshot()
-4. TYPE IN A FIELD: click(x, y) → type_text("hello") → screenshot()
-5. NAVIGATE MENUS: click menu → screenshot → move to item → click() → screenshot
-6. MULTI-STEP: click → type → key("Tab") → type → key("Return") → screenshot()
+4. TEXT CLICK: click_text("Submit") → screenshot()
+5. TYPE IN A FIELD: click(x, y) → type_text("hello") → screenshot()
+6. NAVIGATE MENUS: click menu → screenshot → move to item → click() → screenshot
+7. MULTI-STEP: click → type → key("Tab") → type → key("Return") → screenshot()
 
 RULES:
 - Always start with screenshot() to see the current desktop state.
@@ -68,6 +79,9 @@ RULES:
 
 _desktop: DesktopController | None = None
 _vision: VisionPipeline | None = None
+_session = os.environ.get("VIEWPORT_SESSION", "default")
+_VIEWPORT_DIR = os.path.expanduser("~/.viewport")
+_HISTORY_DIR = os.path.expanduser(f"~/.viewport/history/desktop-{_session}")
 
 
 def _get_desktop() -> DesktopController:
@@ -99,6 +113,41 @@ def _scale_coords(x: int, y: int) -> tuple[int, int]:
     return int(x * sx), int(y * sy)
 
 
+def _save_screenshot(jpeg_bytes: bytes):
+    """Save screenshot to history and write latest for dashboard live view."""
+    try:
+        os.makedirs(_HISTORY_DIR, exist_ok=True)
+        ts = datetime.now(timezone.utc)
+        filename = f"{ts.strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+        filepath = os.path.join(_HISTORY_DIR, filename)
+        with open(filepath, "wb") as f:
+            f.write(jpeg_bytes)
+        with open(os.path.join(_HISTORY_DIR, "index.jsonl"), "a") as f:
+            f.write(json.dumps({
+                "ts": ts.isoformat(),
+                "file": filename,
+                "url": "desktop://screen",
+                "title": f"Desktop ({_session})" if _session != "default" else "Desktop",
+                "session": _session,
+            }) + "\n")
+    except Exception:
+        pass
+
+    # Write latest screenshot + metadata for dashboard polling
+    try:
+        os.makedirs(_VIEWPORT_DIR, exist_ok=True)
+        with open(os.path.join(_VIEWPORT_DIR, f"desktop-{_session}.jpg"), "wb") as f:
+            f.write(jpeg_bytes)
+        with open(os.path.join(_VIEWPORT_DIR, f"desktop-{_session}.json"), "w") as f:
+            json.dump({
+                "session": _session,
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "label": f"Desktop ({_session})" if _session != "default" else "Desktop",
+            }, f)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
@@ -115,7 +164,75 @@ async def screenshot() -> list:
 
     png = await desktop.screenshot()
     img = vision.process(png)
+    _save_screenshot(img)
     return [MCPImage(data=img, format="jpeg")]
+
+
+@mcp.tool()
+async def click_text(text: str, near: str = "", index: int = 0) -> list:
+    """Click on visible text on the screen. Uses OCR to find text — no coordinate guessing needed.
+
+    - click_text("Submit") — clicks the text "Submit" (must be unique on screen)
+    - click_text("Close", near="Settings") — clicks "Close" nearest to "Settings"
+    - click_text("OK", index=2) — clicks the 2nd "OK" on screen
+
+    If multiple matches and no disambiguator, returns an annotated screenshot showing all matches."""
+    desktop = _get_desktop()
+    vision = _get_vision()
+
+    png = await desktop.screenshot()
+    matches = vision.find_text(png, text)
+
+    if not matches:
+        return [f"Text '{text}' not found on screen. Try screenshot() to see what's visible."]
+
+    # Single match — click it directly
+    if len(matches) == 1:
+        m = matches[0]
+        await desktop.click(m["cx"], m["cy"])
+        return [f"Clicked text '{m['text']}' at ({m['cx']}, {m['cy']})"]
+
+    # Multiple matches — disambiguate
+    if near:
+        # Find the reference text and pick the closest match to it
+        ref_matches = vision.find_text(png, near)
+        if ref_matches:
+            ref = ref_matches[0]
+            rx, ry = ref["cx"], ref["cy"]
+            best = min(
+                matches,
+                key=lambda m: math.hypot(m["cx"] - rx, m["cy"] - ry),
+            )
+            await desktop.click(best["cx"], best["cy"])
+            return [
+                f"Found {len(matches)} matches for '{text}'. "
+                f"Clicked the one nearest '{near}': '{best['text']}' at ({best['cx']}, {best['cy']})"
+            ]
+        # near text not found — fall through to annotation
+        return [
+            f"Found {len(matches)} matches for '{text}' but reference text '{near}' not found. "
+            f"Try click_text(\"{text}\", index=N) with one of the numbers below.",
+        ]
+
+    if index > 0:
+        if index > len(matches):
+            return [f"Index {index} out of range — only {len(matches)} matches found for '{text}'."]
+        m = matches[index - 1]
+        await desktop.click(m["cx"], m["cy"])
+        return [f"Clicked match #{index}: '{m['text']}' at ({m['cx']}, {m['cy']})"]
+
+    # No disambiguator — show annotated screenshot with all matches
+    annotated = vision.annotate_matches(png, matches)
+    _save_screenshot(annotated)
+    listing = "\n".join(
+        f"  {i}. '{m['text']}' at ({m['cx']}, {m['cy']})"
+        for i, m in enumerate(matches, 1)
+    )
+    return [
+        MCPImage(data=annotated, format="jpeg"),
+        f"Found {len(matches)} matches for '{text}':\n{listing}\n\n"
+        f"Call click_text(\"{text}\", index=N) to click the one you want.",
+    ]
 
 
 @mcp.tool()
@@ -129,6 +246,7 @@ async def move(x: int, y: int) -> list:
     await desktop.move_mouse(sx, sy)
     png = await desktop.screenshot()
     full_img = vision.process(png)
+    _save_screenshot(full_img)
     crop_img = vision.cursor_crop(png, sx, sy)
     return [
         MCPImage(data=full_img, format="jpeg"),

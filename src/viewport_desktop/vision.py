@@ -7,8 +7,15 @@ so desktop-nav has no dependency on Playwright/browser code.
 from __future__ import annotations
 
 import io
+import math
 
 from PIL import Image, ImageDraw, ImageFont
+
+try:
+    import pytesseract
+    _HAS_TESSERACT = True
+except ImportError:
+    _HAS_TESSERACT = False
 
 
 _TICK_FONT: ImageFont.FreeTypeFont | ImageFont.ImageFont | None = None
@@ -208,3 +215,154 @@ class VisionPipeline:
             return ratio, image_to_bytes(cropped)
 
         return ratio, None
+
+    # --- OCR text finding ---
+
+    def find_text(self, png_bytes: bytes, query: str) -> list[dict]:
+        """Find all occurrences of *query* (case-insensitive substring) on screen.
+
+        Uses pytesseract OCR at native resolution.  Returns a list of match
+        dicts: ``[{"text": str, "cx": int, "cy": int, "x": int, "y": int,
+        "w": int, "h": int}]`` where cx/cy are center coordinates in native
+        screen pixels.
+        """
+        if not _HAS_TESSERACT:
+            print("[vision] pytesseract not installed — OCR disabled. "
+                  "Install with: pip install pytesseract", flush=True)
+            return []
+
+        img = Image.open(io.BytesIO(png_bytes))
+
+        # Run Tesseract and get per-word bounding boxes
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+
+        # Group words into lines keyed by (block_num, par_num, line_num)
+        lines: dict[tuple[int, int, int], list[dict]] = {}
+        n_boxes = len(data["text"])
+        for i in range(n_boxes):
+            word = data["text"][i].strip()
+            if not word:
+                continue
+            key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+            lines.setdefault(key, []).append({
+                "text": word,
+                "x": data["left"][i],
+                "y": data["top"][i],
+                "w": data["width"][i],
+                "h": data["height"][i],
+            })
+
+        query_lower = query.lower()
+        matches: list[dict] = []
+
+        for _key, words in lines.items():
+            line_text = " ".join(w["text"] for w in words)
+            line_lower = line_text.lower()
+
+            # Search for all occurrences of query within this line
+            start = 0
+            while True:
+                idx = line_lower.find(query_lower, start)
+                if idx == -1:
+                    break
+
+                # Map character offset back to word indices.  Walk the
+                # joined string tracking cumulative character positions.
+                char_pos = 0
+                first_word_idx: int | None = None
+                last_word_idx: int | None = None
+                match_end = idx + len(query_lower)
+
+                for wi, w in enumerate(words):
+                    word_start = char_pos
+                    word_end = char_pos + len(w["text"])
+                    # Does this word overlap the match span?
+                    if word_end > idx and word_start < match_end:
+                        if first_word_idx is None:
+                            first_word_idx = wi
+                        last_word_idx = wi
+                    char_pos = word_end + 1  # +1 for the joining space
+
+                if first_word_idx is not None and last_word_idx is not None:
+                    # Compute bounding box covering the matched words
+                    mw = words[first_word_idx:last_word_idx + 1]
+                    bx = min(w["x"] for w in mw)
+                    by = min(w["y"] for w in mw)
+                    bx2 = max(w["x"] + w["w"] for w in mw)
+                    by2 = max(w["y"] + w["h"] for w in mw)
+                    bw = bx2 - bx
+                    bh = by2 - by
+                    matches.append({
+                        "text": line_text[idx:idx + len(query_lower)],
+                        "cx": bx + bw // 2,
+                        "cy": by + bh // 2,
+                        "x": bx,
+                        "y": by,
+                        "w": bw,
+                        "h": bh,
+                    })
+
+                start = idx + 1  # continue searching for more in this line
+
+        return matches
+
+    def annotate_matches(self, png_bytes: bytes, matches: list[dict]) -> bytes:
+        """Draw numbered red badges at each match position and return JPEG.
+
+        Opens the PNG at native resolution, draws badges, then downscales to
+        the normal screenshot size and adds coordinate tick marks.
+        """
+        img = Image.open(io.BytesIO(png_bytes))
+
+        draw = ImageDraw.Draw(img)
+
+        # Choose badge radius and font size based on image size
+        badge_r = max(16, img.width // 80)
+        try:
+            badge_font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                badge_r,
+            )
+        except (OSError, IOError):
+            badge_font = ImageFont.load_default()
+
+        for i, m in enumerate(matches, 1):
+            cx, cy = m["cx"], m["cy"]
+
+            # Draw red rectangle around match
+            draw.rectangle(
+                [m["x"] - 2, m["y"] - 2, m["x"] + m["w"] + 2, m["y"] + m["h"] + 2],
+                outline=(255, 0, 0),
+                width=2,
+            )
+
+            # Draw numbered red circle badge above-right of match
+            bx = m["x"] + m["w"] + badge_r
+            by = m["y"] - badge_r
+            # Clamp to image bounds
+            bx = max(badge_r, min(bx, img.width - badge_r))
+            by = max(badge_r, min(by, img.height - badge_r))
+
+            draw.ellipse(
+                [bx - badge_r, by - badge_r, bx + badge_r, by + badge_r],
+                fill=(220, 30, 30),
+                outline=(255, 255, 255),
+                width=2,
+            )
+
+            # Draw number centered in badge
+            label = str(i)
+            bbox = draw.textbbox((0, 0), label, font=badge_font)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            draw.text(
+                (bx - tw // 2, by - th // 2 - 1),
+                label,
+                fill=(255, 255, 255),
+                font=badge_font,
+            )
+
+        # Downscale to normal screenshot size
+        img.thumbnail((self.max_width, self.max_height), Image.Resampling.LANCZOS)
+        img = overlay_coordinate_reference(img)
+        return image_to_bytes(img)
