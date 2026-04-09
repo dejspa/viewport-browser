@@ -65,6 +65,60 @@ def overlay_coordinate_reference(img: Image.Image) -> Image.Image:
     return annotated
 
 
+_GRID_FONT: ImageFont.FreeTypeFont | ImageFont.ImageFont | None = None
+
+
+def _get_grid_font() -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    global _GRID_FONT
+    if _GRID_FONT is None:
+        for path in [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        ]:
+            try:
+                _GRID_FONT = ImageFont.truetype(path, 9)
+                break
+            except (OSError, IOError):
+                continue
+        if _GRID_FONT is None:
+            _GRID_FONT = ImageFont.load_default()
+    return _GRID_FONT
+
+
+def overlay_grid_labels(
+    img: Image.Image, cols: int = 24, rows: int = 12
+) -> tuple[Image.Image, dict[str, tuple[int, int]]]:
+    """Overlay a grid of unique labels on the screenshot.
+
+    Each cell gets a label like "a0", "a1", ..., "b0", "b1", etc.
+    Row = letter (a-z), Column = number (0-99).
+
+    Returns (annotated_image, label_map) where label_map maps
+    label string -> (center_x, center_y) in image pixel coordinates.
+    """
+    annotated = img.copy()
+    draw = ImageDraw.Draw(annotated)
+    font = _get_grid_font()
+
+    cell_w = img.width / cols
+    cell_h = img.height / rows
+    label_map: dict[str, tuple[int, int]] = {}
+
+    for r in range(rows):
+        for c in range(cols):
+            label = f"{chr(97 + r)}{c}"
+            cx = int(c * cell_w + cell_w / 2)
+            cy = int(r * cell_h + cell_h / 2)
+            label_map[label] = (cx, cy)
+
+            # Draw label with dark outline for readability on any background
+            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                draw.text((cx - 7 + dx, cy - 5 + dy), label, fill=(0, 0, 0), font=font)
+            draw.text((cx - 7, cy - 5), label, fill=(255, 80, 80), font=font)
+
+    return annotated, label_map
+
+
 def image_to_bytes(img: Image.Image, fmt: str = "JPEG", quality: int = 75) -> bytes:
     """Encode image to raw bytes."""
     buf = io.BytesIO()
@@ -163,6 +217,20 @@ class VisionPipeline:
 
         img = overlay_coordinate_reference(img)
         return image_to_bytes(img)
+
+    def process_with_grid(self, png_bytes: bytes, cols: int = 24, rows: int = 12) -> tuple[bytes, dict[str, tuple[int, int]]]:
+        """Process screenshot with clickable grid labels instead of tick marks.
+
+        Returns (jpeg_bytes, label_map) where label_map maps "a0" -> (cx, cy)
+        in the downscaled image coordinates. Use with click_label().
+        """
+        img = Image.open(io.BytesIO(png_bytes))
+        img.thumbnail((self.max_width, self.max_height), Image.Resampling.LANCZOS)
+        self.actual_width = img.width
+        self.actual_height = img.height
+
+        img, label_map = overlay_grid_labels(img, cols, rows)
+        return image_to_bytes(img), label_map
 
     def cursor_crop(self, png_bytes: bytes, cx: int, cy: int, size: int = 400) -> bytes:
         """Crop a region around (cx, cy) at native resolution with a red crosshair.

@@ -7,6 +7,7 @@ Just like a human sitting at the computer.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import math
 import os
@@ -15,8 +16,10 @@ from datetime import datetime, timezone
 
 from mcp.server.fastmcp import FastMCP, Image as MCPImage
 
+from PIL import Image
+
 from .desktop import DesktopController
-from .vision import VisionPipeline
+from .vision import VisionPipeline, find_changed_region
 
 mcp = FastMCP(
     "desktop",
@@ -25,8 +28,10 @@ Vision-first desktop controller. Full computer control through screenshots and i
 No OS APIs — pure vision, just like a human.
 
 TOOLS:
-- screenshot() — see the full desktop
-- click_text(text, near, index) — click visible text on screen using OCR (no coordinates needed!)
+- screenshot() — see the desktop with a clickable GRID overlay (labels like 'a0', 'b5', 'f12')
+- click_label(label) — click a grid label from the screenshot. THE FASTEST way to click anything!
+- navigate(url) — open a URL in the browser (handles everything: focus, address bar, typing, Enter)
+- click_text(text, near, index) — click visible text on screen using OCR
 - move(x, y) — move mouse and see zoomed view around cursor (for precise targeting)
 - click(x, y) — quick click at coordinates (or omit x,y to click at current position after move)
 - double_click(x, y) — double-click (or omit x,y for current position)
@@ -59,13 +64,14 @@ SMART CLICKING — use click_text() for text targets:
 - Falls back to numbered annotation if multiple matches.
 
 STRATEGY GUIDE:
-1. OPEN AN APP: key("super") → type_text("firefox", press_enter=true) → screenshot()
-2. PRECISE CLICK: move(x, y) → verify target in zoom → click() → screenshot()
-3. QUICK CLICK: click(x, y) → screenshot()
-4. TEXT CLICK: click_text("Submit") → screenshot()
-5. TYPE IN A FIELD: click(x, y) → type_text("hello") → screenshot()
-6. NAVIGATE MENUS: click menu → screenshot → move to item → click() → screenshot
-7. MULTI-STEP: click → type → key("Tab") → type → key("Return") → screenshot()
+1. OPEN A WEBSITE: navigate("linkedin.com") → done in one call
+2. OPEN AN APP: key("super") → type_text("firefox", press_enter=true) → screenshot()
+3. PRECISE CLICK: move(x, y) → verify target in zoom → click() → screenshot()
+4. QUICK CLICK: click(x, y) → screenshot()
+5. TEXT CLICK: click_text("Submit") → screenshot()
+6. TYPE IN A FIELD: click(x, y) → type_text("hello") → screenshot()
+7. NAVIGATE MENUS: click menu → screenshot → move to item → click() → screenshot
+8. MULTI-STEP: click → type → key("Tab") → type → key("Return") → screenshot()
 
 RULES:
 - Always start with screenshot() to see the current desktop state.
@@ -79,6 +85,7 @@ RULES:
 
 _desktop: DesktopController | None = None
 _vision: VisionPipeline | None = None
+_grid_labels: dict[str, tuple[int, int]] = {}  # label -> (img_x, img_y)
 _session = os.environ.get("VIEWPORT_SESSION", "default")
 _VIEWPORT_DIR = os.path.expanduser("~/.viewport")
 _HISTORY_DIR = os.path.expanduser(f"~/.viewport/history/desktop-{_session}")
@@ -155,7 +162,11 @@ def _save_screenshot(jpeg_bytes: bytes):
 
 @mcp.tool()
 async def screenshot() -> list:
-    """Take a screenshot of the entire desktop. Always call this first to see what's on screen."""
+    """Take a screenshot with a clickable grid overlay.
+    Each cell has a label like 'a0', 'b5', 'f12' etc.
+    To click any spot: find the label nearest your target, then call click_label('b5').
+    No coordinate guessing needed — just read the label text."""
+    global _grid_labels
     desktop = _get_desktop()
     vision = _get_vision()
     err = desktop.check_tools()
@@ -163,9 +174,93 @@ async def screenshot() -> list:
         return [f"ERROR: {err}\n\nInstall with: sudo apt install scrot xdotool"]
 
     png = await desktop.screenshot()
-    img = vision.process(png)
+    img, _grid_labels = vision.process_with_grid(png)
     _save_screenshot(img)
     return [MCPImage(data=img, format="jpeg")]
+
+
+@mcp.tool()
+async def click_label(label: str) -> list:
+    """Click on a grid label from the screenshot. Just read the label near your target and click it.
+    Examples: click_label('a5'), click_label('d12'), click_label('g3')
+    Labels are row letter (a-z) + column number (0-23). Instant, no coordinate math."""
+    global _grid_labels
+    label = label.lower().strip()
+    if label not in _grid_labels:
+        return [f"Label '{label}' not found. Take a screenshot() first, then use a label from the grid."]
+
+    desktop = _get_desktop()
+    ix, iy = _grid_labels[label]
+    sx, sy = _scale_coords(ix, iy)
+    await desktop.click(sx, sy)
+    return [f"Clicked label '{label}' at screen position ({sx}, {sy})"]
+
+
+@mcp.tool()
+async def navigate(url: str) -> list:
+    """Open a URL in the browser. Handles finding the browser, focusing the address bar, typing the URL, and pressing Enter.
+    Works with any browser (Chrome, Firefox, Edge). Returns a screenshot after the page loads.
+
+    Examples: navigate("linkedin.com"), navigate("google.com/search?q=hello")"""
+    desktop = _get_desktop()
+    vision = _get_vision()
+
+    # Ensure URL has protocol for actual navigation
+    display_url = url
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    # Ctrl+L focuses the address bar in any browser (universal shortcut)
+    await desktop.key("ctrl+l")
+    await asyncio.sleep(0.3)
+    await desktop.type_text(display_url)
+    await desktop.key("Return")
+    await asyncio.sleep(3)
+
+    # Take screenshot and return
+    png = await desktop.screenshot()
+    img = vision.process(png)
+    _save_screenshot(img)
+    return [MCPImage(data=img, format="jpeg"), f"Navigated to {url}"]
+
+
+async def _verify_click(
+    desktop: DesktopController,
+    png_before: bytes,
+    m: dict,
+    label: str,
+) -> str:
+    """Click a match, verify the screen changed, retry with offsets if needed.
+
+    Returns a status message describing what happened.
+    """
+    await desktop.click(m["cx"], m["cy"])
+    await asyncio.sleep(0.5)
+    png_after = await desktop.screenshot()
+
+    img_before = Image.open(io.BytesIO(png_before))
+    img_after = Image.open(io.BytesIO(png_after))
+    diff_ratio, _ = find_changed_region(img_before, img_after)
+
+    if diff_ratio >= 0.02:
+        return label
+
+    # Screen didn't change — try offset positions
+    offsets = [
+        (m["cx"], m["cy"] - m["h"] // 2, "above"),
+        (m["cx"], m["cy"] + m["h"] // 2, "below"),
+        (m["cx"] - m["w"] // 4, m["cy"], "left of"),
+    ]
+    for ox, oy, direction in offsets:
+        await desktop.click(ox, oy)
+        await asyncio.sleep(0.5)
+        png_retry = await desktop.screenshot()
+        img_retry = Image.open(io.BytesIO(png_retry))
+        diff_ratio, _ = find_changed_region(img_before, img_retry)
+        if diff_ratio >= 0.02:
+            return f"{label} (retried {direction} text)"
+
+    return f"{label} — clicked but screen didn't change"
 
 
 @mcp.tool()
@@ -176,7 +271,8 @@ async def click_text(text: str, near: str = "", index: int = 0) -> list:
     - click_text("Close", near="Settings") — clicks "Close" nearest to "Settings"
     - click_text("OK", index=2) — clicks the 2nd "OK" on screen
 
-    If multiple matches and no disambiguator, returns an annotated screenshot showing all matches."""
+    If multiple matches and no disambiguator, returns an annotated screenshot showing all matches.
+    Verifies the click worked by checking if the screen changed, and retries with offsets if needed."""
     desktop = _get_desktop()
     vision = _get_vision()
 
@@ -186,11 +282,14 @@ async def click_text(text: str, near: str = "", index: int = 0) -> list:
     if not matches:
         return [f"Text '{text}' not found on screen. Try screenshot() to see what's visible."]
 
-    # Single match — click it directly
+    # Single match — click it directly with verification
     if len(matches) == 1:
         m = matches[0]
-        await desktop.click(m["cx"], m["cy"])
-        return [f"Clicked text '{m['text']}' at ({m['cx']}, {m['cy']})"]
+        msg = await _verify_click(
+            desktop, png, m,
+            f"Clicked text '{m['text']}' at ({m['cx']}, {m['cy']})",
+        )
+        return [msg]
 
     # Multiple matches — disambiguate
     if near:
@@ -203,11 +302,12 @@ async def click_text(text: str, near: str = "", index: int = 0) -> list:
                 matches,
                 key=lambda m: math.hypot(m["cx"] - rx, m["cy"] - ry),
             )
-            await desktop.click(best["cx"], best["cy"])
-            return [
+            msg = await _verify_click(
+                desktop, png, best,
                 f"Found {len(matches)} matches for '{text}'. "
-                f"Clicked the one nearest '{near}': '{best['text']}' at ({best['cx']}, {best['cy']})"
-            ]
+                f"Clicked the one nearest '{near}': '{best['text']}' at ({best['cx']}, {best['cy']})",
+            )
+            return [msg]
         # near text not found — fall through to annotation
         return [
             f"Found {len(matches)} matches for '{text}' but reference text '{near}' not found. "
@@ -218,8 +318,11 @@ async def click_text(text: str, near: str = "", index: int = 0) -> list:
         if index > len(matches):
             return [f"Index {index} out of range — only {len(matches)} matches found for '{text}'."]
         m = matches[index - 1]
-        await desktop.click(m["cx"], m["cy"])
-        return [f"Clicked match #{index}: '{m['text']}' at ({m['cx']}, {m['cy']})"]
+        msg = await _verify_click(
+            desktop, png, m,
+            f"Clicked match #{index}: '{m['text']}' at ({m['cx']}, {m['cy']})",
+        )
+        return [msg]
 
     # No disambiguator — show annotated screenshot with all matches
     annotated = vision.annotate_matches(png, matches)
