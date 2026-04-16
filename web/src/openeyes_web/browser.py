@@ -167,6 +167,7 @@ class BrowserManager:
         self._cdp_port = cdp_port
         self._headed = headed
         self._slow_mo = slow_mo
+        self._chrome_pid: int | None = None  # PID of Chrome we launched (None if we reused an existing one)
 
     async def _ensure_browser(self) -> Page:
         if self._pages:
@@ -199,10 +200,16 @@ class BrowserManager:
                     reverse=True,
                 )
                 chrome_path = candidates[0] if candidates else self._pw.chromium.executable_path
+                # Per-port user-data-dir keeps sessions' cookies/storage isolated
+                # and lets multiple Chrome instances coexist (Chrome refuses to
+                # launch a second instance sharing a profile directory).
+                user_data_dir = f"/tmp/openeyes-web-chrome-{port}"
+                os.makedirs(user_data_dir, exist_ok=True)
                 chrome_args = [
                     chrome_path,
                     f"--remote-debugging-port={port}",
                     "--remote-debugging-address=0.0.0.0",
+                    f"--user-data-dir={user_data_dir}",
                     "--no-first-run",
                     "--no-default-browser-check",
                     "--no-sandbox",
@@ -221,29 +228,35 @@ class BrowserManager:
 
                 if use_xvfb:
                     self._xvfb_display = ":99"
-                    # Don't store reference — Xvfb must outlive this process
-                    subprocess.Popen(
-                        ["Xvfb", self._xvfb_display, "-screen", "0",
-                         f"{self._vw}x{self._vh}x24", "-nolisten", "tcp"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        start_new_session=True,
-                    )
-                    time.sleep(0.5)
+                    # Xvfb is shared across all sessions — only launch if not already running.
+                    # (X lock file is the standard way to detect a running display.)
+                    if not os.path.exists(f"/tmp/.X99-lock"):
+                        subprocess.Popen(
+                            ["Xvfb", self._xvfb_display, "-screen", "0",
+                             f"{self._vw}x{self._vh}x24", "-nolisten", "tcp"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            start_new_session=True,  # survive MCP shutdown
+                        )
+                        time.sleep(0.5)
+                        print(f"[openeyes-web] Started Xvfb on {self._xvfb_display}", file=sys.stderr)
+                    else:
+                        print(f"[openeyes-web] Reusing Xvfb on {self._xvfb_display}", file=sys.stderr)
                     env["DISPLAY"] = self._xvfb_display
-                    print(f"[openeyes-web] Using Xvfb on {self._xvfb_display}", file=sys.stderr)
                 else:
                     chrome_args.insert(1, "--headless=new")
                     print("[openeyes-web] No Xvfb — using --headless=new for CDP", file=sys.stderr)
 
-                # Don't store reference — Chrome must outlive this process
-                subprocess.Popen(
+                # Chrome survives this process, but we track the PID so TTL
+                # cleanup can terminate it when the session expires.
+                proc = subprocess.Popen(
                     chrome_args,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     env=env,
                     start_new_session=True,  # survive agent/MCP shutdown
                 )
+                self._chrome_pid = proc.pid
                 for _ in range(30):
                     try:
                         urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=1)
@@ -395,10 +408,9 @@ class BrowserManager:
         ]
 
     async def close_tab(self, index: int) -> str | None:
-        """Close a tab. Won't close pinned tabs or the last remaining tab.
+        """Close a tab. Pinned tabs are protected. Closing the last tab leaves
+        no pages — the caller is expected to tear down the session.
         Returns error message if refused, None on success."""
-        if len(self._pages) <= 1:
-            return "Cannot close the last tab"
         page = self._pages[index]
         pin = self._pins.get(id(page))
         if pin:
@@ -407,7 +419,7 @@ class BrowserManager:
         self._pins.pop(id(page), None)
         await page.close()
         if self._active >= len(self._pages):
-            self._active = len(self._pages) - 1
+            self._active = max(0, len(self._pages) - 1)
         return None
 
     # --- Navigation (tab-aware) ---
@@ -533,12 +545,23 @@ class BrowserManager:
         page = await self._ensure_browser()
         return await page.title()
 
-    async def close(self) -> None:
-        """Disconnect from browser. Chrome/Xvfb are NOT killed — they persist."""
+    async def close(self, kill_chrome: bool = False) -> None:
+        """Disconnect from browser. By default Chrome/Xvfb persist; pass
+        kill_chrome=True to also terminate the Chrome process we launched
+        (used by TTL cleanup for expired sessions)."""
         if self._browser:
             await self._browser.close()
         if self._pw:
             await self._pw.stop()
+        if kill_chrome and self._chrome_pid:
+            import signal
+            try:
+                os.kill(self._chrome_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                print(f"[openeyes-web] Failed to kill Chrome pid={self._chrome_pid}: {e}", file=sys.stderr)
+            self._chrome_pid = None
         self._pages = []
         self._active = 0
         self._pins = {}

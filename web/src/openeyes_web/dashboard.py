@@ -12,9 +12,27 @@ import urllib.request
 
 import websockets
 
-CDP_PORT = 9222
+CDP_PORT = 9222  # fallback when no session file exists (pre-multisession deployments)
 HTTP_PORT = 6080
 WS_PORT = 6081
+SESSION_FILE = "/tmp/openeyes-web-sessions.json"
+
+
+def _load_sessions() -> dict:
+    try:
+        with open(SESSION_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _session_port(session_id: str) -> int:
+    """Resolve CDP port for a session. Falls back to CDP_PORT for legacy 'default'."""
+    data = _load_sessions()
+    rec = data.get(session_id)
+    if rec and "port" in rec:
+        return rec["port"]
+    return CDP_PORT
 
 _HTML = """<!DOCTYPE html>
 <html>
@@ -29,7 +47,18 @@ body{background:#0f1117;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFo
 .st{font-size:13px;color:#888}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
 .dot.on{background:#4ade80}.dot.off{background:#ef4444}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(480px,1fr));gap:16px;padding:16px}
+.grid{padding:16px;display:flex;flex-direction:column;gap:20px}
+.session{border:1px solid #2a2d37;border-radius:10px;background:#13151c;overflow:hidden}
+.sesshead{padding:10px 16px;background:#1a1d27;border-bottom:1px solid #2a2d37;display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none}
+.sesshead:hover{background:#22252f}
+.sesshead .sid{font-weight:600;font-size:14px;color:#e0e0e0;display:flex;align-items:center;gap:8px}
+.sesshead .sid .caret{font-size:10px;color:#888;transition:transform .15s}
+.session.collapsed .sesshead .caret{transform:rotate(-90deg)}
+.sesshead .smeta{font-size:12px;color:#888;display:flex;gap:12px}
+.sesshead .smeta .act{color:#4ade80}
+.sesshead .smeta .idle{color:#f0c040}
+.session.collapsed .stiles{display:none}
+.stiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(480px,1fr));gap:12px;padding:14px}
 .tile{background:#1a1d27;border-radius:8px;overflow:hidden;border:1px solid #2a2d37}
 .tile:hover{border-color:#4a9eff}
 .th{padding:8px 12px;background:#22252f;font-size:13px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;display:flex;align-items:center;justify-content:space-between}
@@ -115,67 +144,114 @@ function initModelSel(){
 }
 initModelSel();
 
-async function gt(){
+async function gsess(){
   try{
-    const r=await fetch('/api/tabs');
-    const t=await r.json();
-    const p=t.filter(x=>x.type==='page'&&!x.url.startsWith('chrome')&&!x.parentId);
-    document.getElementById('st').innerHTML='<span class="dot on"></span>Connected — '+p.length+' tab(s)';
-    return p;
-  }catch(e){
-    document.getElementById('st').innerHTML='<span class="dot off"></span>Not connected';
-    return[];
-  }
+    const r=await fetch('/api/sessions');
+    return await r.json();
+  }catch(e){return[];}
 }
 
-function ct(t){
-  if(S[t.id])return;
-  const wsUrl='ws://'+location.hostname+':'+WS_PORT+'/ws/'+t.id;
+async function gt(sessionId){
+  try{
+    const r=await fetch('/api/tabs?session='+encodeURIComponent(sessionId));
+    const t=await r.json();
+    if(!Array.isArray(t))return[];
+    return t.filter(x=>x.type==='page'&&!x.url.startsWith('chrome')&&!x.parentId);
+  }catch(e){return[];}
+}
+
+function fmtIdle(sec){
+  if(sec==null)return '';
+  if(sec<60)return sec+'s idle';
+  if(sec<3600)return Math.floor(sec/60)+'m idle';
+  if(sec<86400)return Math.floor(sec/3600)+'h idle';
+  return Math.floor(sec/86400)+'d idle';
+}
+
+function tkey(session,tabId){return session+'/'+tabId;}
+
+function ct(session,t){
+  const k=tkey(session,t.id);
+  if(S[k])return;
+  const wsUrl='ws://'+location.hostname+':'+WS_PORT+'/ws/'+encodeURIComponent(session)+'/'+t.id;
   const ws=new WebSocket(wsUrl);
-  const s={ws,t,n:0,f:null,m:null};S[t.id]=s;
+  const s={ws,t,session,k,n:0,f:null,m:null};S[k]=s;
   ws.onopen=()=>ws.send(JSON.stringify({id:1,method:'Page.startScreencast',
     params:{format:'jpeg',quality:50,maxWidth:1280,maxHeight:900,everyNthFrame:2}}));
   ws.onmessage=e=>{
     const msg=JSON.parse(e.data);
     if(msg.method==='Page.screencastFrame'){
       s.n++;s.f=msg.params.data;s.m=msg.params.metadata;
-      const i=document.getElementById('i-'+t.id);
+      const i=document.getElementById('i-'+k);
       if(i)i.src='data:image/jpeg;base64,'+msg.params.data;
-      if(fid===t.id)document.getElementById('fsi').src='data:image/jpeg;base64,'+msg.params.data;
+      if(fid===k)document.getElementById('fsi').src='data:image/jpeg;base64,'+msg.params.data;
       ws.send(JSON.stringify({id:100+s.n,method:'Page.screencastFrameAck',
         params:{sessionId:msg.params.sessionId}}));
     }
   };
-  ws.onclose=()=>{delete S[t.id];rt(t.id);};
+  ws.onclose=()=>{delete S[k];rt(k);};
 }
 
 function fmt(n){if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'k';return n.toString();}
 
-function mt(t){
-  let el=document.getElementById('t-'+t.id);
+function sessContainer(sess){
+  let el=document.getElementById('s-'+sess.id);
+  if(el){
+    el.querySelector('.smeta').innerHTML=
+      '<span>port '+(sess.port||'?')+'</span>'+
+      '<span class="'+(sess.active?'act':'')+'">'+(sess.active?'active':'inactive')+'</span>'+
+      (sess.idle_seconds!=null?'<span class="idle">'+fmtIdle(sess.idle_seconds)+'</span>':'');
+    return el.querySelector('.stiles');
+  }
+  el=document.createElement('div');el.className='session';el.id='s-'+sess.id;
+  const isCollapsed=localStorage.getItem('vp-collapsed-'+sess.id)==='1';
+  if(isCollapsed)el.classList.add('collapsed');
+  const hd=document.createElement('div');hd.className='sesshead';
+  hd.onclick=function(){
+    el.classList.toggle('collapsed');
+    localStorage.setItem('vp-collapsed-'+sess.id,el.classList.contains('collapsed')?'1':'0');
+  };
+  const sid=document.createElement('div');sid.className='sid';
+  sid.innerHTML='<span class="caret">▼</span>session: '+sess.id;
+  const meta=document.createElement('div');meta.className='smeta';
+  meta.innerHTML=
+    '<span>port '+(sess.port||'?')+'</span>'+
+    '<span class="'+(sess.active?'act':'')+'">'+(sess.active?'active':'inactive')+'</span>'+
+    (sess.idle_seconds!=null?'<span class="idle">'+fmtIdle(sess.idle_seconds)+'</span>':'');
+  hd.appendChild(sid);hd.appendChild(meta);
+  const tiles=document.createElement('div');tiles.className='stiles';
+  el.appendChild(hd);el.appendChild(tiles);
+  document.getElementById('grid').appendChild(el);
+  return tiles;
+}
+
+function mt(session,t,container){
+  const k=tkey(session,t.id);
+  let el=document.getElementById('t-'+k);
   if(el){el.querySelector('.title').textContent=t.title||t.url;return;}
-  el=document.createElement('div');el.className='tile';el.id='t-'+t.id;
+  el=document.createElement('div');el.className='tile';el.id='t-'+k;
   const hdr=document.createElement('div');hdr.className='th';
   const title=document.createElement('span');title.className='title';title.textContent=t.title||t.url;
-  const tkn=document.createElement('span');tkn.className='tkn';tkn.id='tk-'+t.id;
+  const tkn=document.createElement('span');tkn.className='tkn';tkn.id='tk-'+k;
   tkn.onclick=function(e){e.stopPropagation();openTmod();};
   const hbtn=document.createElement('button');hbtn.className='hbtn';hbtn.textContent='History';
   hbtn.onclick=function(e){e.stopPropagation();openHmod(t.url,t.title);};
   const cbtn=document.createElement('button');cbtn.className='close';cbtn.textContent='Close';
-  cbtn.onclick=function(e){e.stopPropagation();ctab(t.id);};
+  cbtn.onclick=function(e){e.stopPropagation();ctab(session,t.id);};
   hdr.appendChild(title);hdr.appendChild(tkn);hdr.appendChild(hbtn);hdr.appendChild(cbtn);
   const body=document.createElement('div');body.className='tb';
-  body.onclick=function(){ofs(t.id);};
-  const img=document.createElement('img');img.id='i-'+t.id;
+  body.onclick=function(){ofs(k);};
+  const img=document.createElement('img');img.id='i-'+k;
   const ov=document.createElement('div');ov.className='ov';ov.textContent='Click to interact';
   body.appendChild(img);body.appendChild(ov);
   el.appendChild(hdr);el.appendChild(body);
-  document.getElementById('grid').appendChild(el);
+  container.appendChild(el);
 }
-function rt(id){const x=document.getElementById('t-'+id);if(x)x.remove();ue();}
+function rt(k){const x=document.getElementById('t-'+k);if(x)x.remove();ue();}
+function rs(sessId){const x=document.getElementById('s-'+sessId);if(x)x.remove();}
 
-function sm(id,img,ev,ty){
-  const s=S[id];if(!s||!s.m)return;
+function sm(k,img,ev,ty){
+  const s=S[k];if(!s||!s.m)return;
   const r=img.getBoundingClientRect();
   const x=Math.round((ev.clientX-r.left)*s.m.deviceWidth/r.width);
   const y=Math.round((ev.clientY-r.top)*s.m.deviceHeight/r.height);
@@ -183,14 +259,14 @@ function sm(id,img,ev,ty){
     params:{type:ty,x,y,button:'left',clickCount:1}}));
 }
 
-function ofs(id){
-  fid=id;const s=S[id];
+function ofs(k){
+  fid=k;const s=S[k];
   document.getElementById('fs').classList.add('on');
-  document.getElementById('fst').textContent=s?.t?.title||'';
+  document.getElementById('fst').textContent=(s?.session?'['+s.session+'] ':'')+(s?.t?.title||'');
   const img=document.getElementById('fsi');
   if(s?.f)img.src='data:image/jpeg;base64,'+s.f;
-  img.onmousedown=e=>sm(id,img,e,'mousePressed');
-  img.onmouseup=e=>sm(id,img,e,'mouseReleased');
+  img.onmousedown=e=>sm(k,img,e,'mousePressed');
+  img.onmouseup=e=>sm(k,img,e,'mouseReleased');
   document.onkeydown=e=>{
     if(e.key==='Escape'){xfs();return;}
     const s=S[fid];if(!s)return;
@@ -208,11 +284,12 @@ function ofs(id){
   };
 }
 function xfs(){fid=null;document.getElementById('fs').classList.remove('on');document.onkeydown=null;document.onkeyup=null;}
-function ctab(id){
+function ctab(session,tabId){
   if(!confirm('Close this tab?'))return;
-  fetch('/api/close/'+id,{method:'POST'}).then(()=>{
-    const s=S[id];if(s&&s.ws)s.ws.close();
-    delete S[id];rt(id);
+  const k=tkey(session,tabId);
+  fetch('/api/close/'+encodeURIComponent(session)+'/'+tabId,{method:'POST'}).then(()=>{
+    const s=S[k];if(s&&s.ws)s.ws.close();
+    delete S[k];rt(k);
   });
 }
 function ue(){document.getElementById('mt').style.display=document.getElementById('grid').children.length?'none':'block';}
@@ -352,31 +429,53 @@ async function openTmod(){
 }
 
 async function poll(){
-  const tabs=await gt();
-  const ids=new Set();
-  for(const t of tabs){ids.add(t.id);mt(t);ct(t);}
-  for(const id of Object.keys(S)){if(!ids.has(id))rt(id);}
+  const sessions=await gsess();
+  let connected=false,totalTabs=0;
+  const allKeys=new Set();
+  const liveSessionIds=new Set();
+  // Fetch tabs per session in parallel
+  const results=await Promise.all(sessions.map(async s=>({s,tabs:await gt(s.id)})));
+  for(const{s,tabs} of results){
+    liveSessionIds.add(s.id);
+    const tiles=sessContainer(s);
+    if(tabs.length)connected=true;
+    totalTabs+=tabs.length;
+    for(const t of tabs){
+      const k=tkey(s.id,t.id);
+      allKeys.add(k);
+      mt(s.id,t,tiles);
+      ct(s.id,t);
+    }
+  }
+  // Remove tiles for tabs that are gone
+  for(const k of Object.keys(S)){if(!allKeys.has(k)){const ws=S[k].ws;if(ws)try{ws.close();}catch(e){}delete S[k];rt(k);}}
+  // Remove sessions that no longer exist
+  document.querySelectorAll('.session').forEach(el=>{
+    const id=el.id.slice(2);if(!liveSessionIds.has(id))rs(id);
+  });
+  document.getElementById('st').innerHTML=connected||sessions.length
+    ?'<span class="dot on"></span>'+sessions.length+' session(s) · '+totalTabs+' tab(s)'
+    :'<span class="dot off"></span>No active sessions';
   ue();
-  // Fetch token stats and match by URL
+  // Token stats per tab (URL match)
   try{
     const r=await fetch('/api/tokens');
     const stats=await r.json();
-    const byUrl={};
-    for(const s of stats)byUrl[s.url]=s.tokens;
-    for(const t of tabs){
-      const el=document.getElementById('tk-'+t.id);
-      if(el){
-        const st=stats.find(s=>s.url===t.url);
+    for(const{s,tabs} of results){
+      for(const t of tabs){
+        const k=tkey(s.id,t.id);
+        const el=document.getElementById('tk-'+k);
+        if(!el)continue;
+        const st=stats.find(x=>x.url===t.url&&x.session===s.id);
         if(st&&st.tokens){
           const model=st.model||'unknown';
           const rateKey=model.toLowerCase();
           const RATES=Object.fromEntries(MODELS.map(m=>[m.name.toLowerCase().replace(/[^a-z0-9.-]/g,''),m.rate]));
           let rate=0;
-          for(const[k,v]of Object.entries(RATES)){if(rateKey.includes(k)||k.includes(rateKey)){rate=v;break;}}
+          for(const[kk,vv]of Object.entries(RATES)){if(rateKey.includes(kk)||kk.includes(rateKey)){rate=vv;break;}}
           if(!rate){const am=MODELS[activeModel]||MODELS[0];rate=am?.rate||3;}
           const c=(st.tokens*rate/1e6).toFixed(3);
-          const sess=st.session&&st.session!=='default'?st.session+' · ':'';
-          el.textContent=sess+model+' · '+fmt(st.tokens)+' · $'+c;
+          el.textContent=model+' · '+fmt(st.tokens)+' · $'+c;
         } else el.textContent='';
       }
     }
@@ -406,10 +505,75 @@ class _HTTPHandler(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Length', str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif self.path == '/api/tabs':
+        elif self.path == '/api/sessions':
+            # Return live sessions only — ping each CDP port and drop dead ones
+            # (so closing all tabs in a session makes it vanish from the UI).
             try:
-                resp = urllib.request.urlopen(f'http://localhost:{CDP_PORT}/json', timeout=3)
-                data = resp.read()
+                from .server import get_sessions
+                sessions = get_sessions()
+            except Exception:
+                import time as _t
+                data = _load_sessions()
+                now = _t.time()
+                sessions = []
+                for sid, rec in data.items():
+                    last = rec.get("last_active", 0)
+                    sessions.append({
+                        "id": sid,
+                        "port": rec.get("port"),
+                        "last_active": last,
+                        "idle_seconds": int(now - last) if last else None,
+                        "active": False,
+                    })
+                sessions.sort(key=lambda r: -(r["last_active"] or 0))
+            # Ping each port; reap dead sessions from the session file.
+            persisted = _load_sessions()
+            live = []
+            reaped = False
+            for s in sessions:
+                port = s.get("port")
+                if port is None:
+                    continue
+                try:
+                    urllib.request.urlopen(f'http://localhost:{port}/json/version', timeout=0.3)
+                    live.append(s)
+                except Exception:
+                    if s["id"] in persisted:
+                        persisted.pop(s["id"])
+                        reaped = True
+            if reaped:
+                try:
+                    with open(SESSION_FILE, "w") as f:
+                        json.dump(persisted, f)
+                except Exception:
+                    pass
+            # Back-compat: if nothing is persisted but the legacy CDP port is up, show it.
+            if not live:
+                try:
+                    urllib.request.urlopen(f'http://localhost:{CDP_PORT}/json/version', timeout=0.3)
+                    live = [{"id": "default", "port": CDP_PORT, "last_active": 0, "idle_seconds": None, "active": False}]
+                except Exception:
+                    pass
+            body = json.dumps(live).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path.startswith('/api/tabs'):
+            # Optional ?session=X query param picks which CDP endpoint to query.
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            session = (q.get('session') or ['default'])[0]
+            port = _session_port(session)
+            try:
+                resp = urllib.request.urlopen(f'http://localhost:{port}/json', timeout=3)
+                raw = json.loads(resp.read())
+                # Tag each tab with its session so the frontend can route clicks/WS correctly.
+                for t in raw:
+                    t['_session'] = session
+                data = json.dumps(raw).encode()
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
@@ -417,7 +581,7 @@ class _HTTPHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(data)
             except Exception as e:
-                body = json.dumps({"error": str(e)}).encode()
+                body = json.dumps({"error": str(e), "session": session, "port": port}).encode()
                 self.send_response(502)
                 self.send_header('Content-Length', str(len(body)))
                 self.end_headers()
@@ -503,9 +667,17 @@ class _HTTPHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path.startswith('/api/close/'):
-            tab_id = self.path.split('/')[-1]
+            # Path format: /api/close/{session_id}/{tab_id} (session optional for legacy).
+            parts = self.path.split('/')
+            if len(parts) >= 5:
+                session = parts[3]
+                tab_id = parts[4]
+            else:
+                session = 'default'
+                tab_id = parts[-1]
+            port = _session_port(session)
             try:
-                url = f'http://localhost:{CDP_PORT}/json/close/{tab_id}'
+                url = f'http://localhost:{port}/json/close/{tab_id}'
                 urllib.request.urlopen(url, timeout=3)
                 self.send_response(200)
                 self.end_headers()
@@ -523,14 +695,25 @@ class _HTTPHandler(http.server.BaseHTTPRequestHandler):
 
 
 async def _ws_proxy(ws):
-    """Proxy WebSocket to Chrome CDP."""
+    """Proxy WebSocket to Chrome CDP.
+
+    Path format: /ws/{session_id}/{tab_id}. Legacy /ws/{tab_id} routes to 'default'.
+    """
     path = ws.request.path
     if not path.startswith('/ws/'):
         await ws.close()
         return
 
-    tab_id = path.split('/')[-1]
-    cdp_url = f'ws://localhost:{CDP_PORT}/devtools/page/{tab_id}'
+    parts = path.split('/')
+    # /ws/{session}/{tab_id} → parts = ['', 'ws', session, tab_id]
+    if len(parts) >= 4:
+        session = parts[2]
+        tab_id = parts[3]
+    else:
+        session = 'default'
+        tab_id = parts[-1]
+    port = _session_port(session)
+    cdp_url = f'ws://localhost:{port}/devtools/page/{tab_id}'
 
     try:
         async with websockets.connect(cdp_url, max_size=10_000_000) as cdp:

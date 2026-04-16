@@ -1,12 +1,19 @@
-"""MCP server — vision-first browser controller. Clean screenshots + coordinate-based clicking."""
+"""MCP server — vision-first browser controller. Clean screenshots + coordinate-based clicking.
+
+Multi-session isolation: each MCP client gets its own BrowserManager on a dedicated
+CDP port. Session ID comes from ctx.client_id (SSE) or OPENEYES_WEB_SESSION env var (stdio).
+Sessions inactive > 48h are auto-cleaned (Chrome killed, state kept).
+"""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
+import time
 
-from mcp.server.fastmcp import FastMCP, Image as MCPImage
+from mcp.server.fastmcp import FastMCP, Context, Image as MCPImage
 
 from .browser import BrowserManager
 from .tracker import PageMemory
@@ -75,52 +82,143 @@ RULES:
 """,
 )
 
-# Shared state — lazily initialized, persists across tool calls
-CDP_PORT = int(os.environ.get("OPENEYES_WEB_CDP_PORT", "9222"))
+# ---------------------------------------------------------------------------
+# Session state — per-client isolation
+# ---------------------------------------------------------------------------
 
-_browser: BrowserManager | None = None
+_BASE_CDP_PORT = int(os.environ.get("OPENEYES_WEB_CDP_PORT", "9222"))
+_TTL_SECONDS = 48 * 3600
+_CLEANUP_INTERVAL = 1800  # 30 min
+_SESSION_FILE = "/tmp/openeyes-web-sessions.json"
+
+_browsers: dict[str, BrowserManager] = {}
 _vision: VisionPipeline | None = None
 _memory: PageMemory | None = None
 _page_tokens: dict[int, int] = {}  # id(page) -> cumulative tokens
 _current_model: str = os.environ.get("OPENEYES_WEB_MODEL", "unknown")
-_session = os.environ.get("OPENEYES_WEB_SESSION", "default")
-_TOKEN_FILE = f"/tmp/openeyes-web-tokens-{_session}.json"
+_session_ports: dict[str, int] = {}  # session_id -> CDP port
+_last_active: dict[str, float] = {}  # session_id -> unix timestamp
+_cleanup_started = False
+
 _TOKEN_LOG = os.path.expanduser("~/.openeyes/web/token-log.jsonl")
+_HISTORY_ROOT = os.path.expanduser("~/.openeyes/web/history")
 
 
-def _track(response: list) -> list:
-    """Estimate tokens in response and record for the active tab."""
+def _session_id(ctx: Context | None) -> str:
+    """Resolve session ID from MCP context.
+
+    Each SSE connection gets its own ServerSession object, so id(session) is a
+    stable per-connection key. We prefix with the client-provided name (from
+    InitializeRequest) for readability in logs/dashboard, e.g. 'alpha-f82d30'.
+    Falls back to OPENEYES_WEB_SESSION env var (stdio single-client use), then 'default'.
+    """
+    if ctx is not None:
+        sess = getattr(ctx, "session", None)
+        if sess is not None:
+            name = "agent"
+            cp = getattr(sess, "client_params", None)
+            if cp is not None:
+                ci = getattr(cp, "clientInfo", None)
+                if ci is not None and getattr(ci, "name", None):
+                    # sanitize name for use in paths/URLs
+                    raw = str(ci.name).strip()
+                    name = "".join(c if c.isalnum() or c in "-_." else "_" for c in raw)[:32] or "agent"
+            return f"{name}-{id(sess) & 0xffffff:06x}"
+    return os.environ.get("OPENEYES_WEB_SESSION", "default")
+
+
+def _load_sessions() -> dict[str, dict]:
+    try:
+        with open(_SESSION_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_sessions(data: dict[str, dict]) -> None:
+    try:
+        with open(_SESSION_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def _update_session_record(session_id: str, port: int, chrome_pid: int | None = None) -> None:
+    data = _load_sessions()
+    rec = data.get(session_id, {})
+    rec["port"] = port
+    rec["last_active"] = time.time()
+    if chrome_pid is not None:
+        rec["chrome_pid"] = chrome_pid
+    data[session_id] = rec
+    _save_sessions(data)
+
+
+def _allocate_port(session_id: str) -> int:
+    """Return a CDP port for this session, allocating a fresh one if needed."""
+    if session_id in _session_ports:
+        return _session_ports[session_id]
+    persisted = _load_sessions()
+    if session_id in persisted:
+        port = persisted[session_id]["port"]
+        _session_ports[session_id] = port
+        return port
+    used = set(_session_ports.values()) | {r["port"] for r in persisted.values()}
+    # "default" always gets the base port (back-compat with single-session deployments)
+    if session_id == "default" and _BASE_CDP_PORT not in used:
+        port = _BASE_CDP_PORT
+    else:
+        port = _BASE_CDP_PORT
+        while port in used:
+            port += 1
+    _session_ports[session_id] = port
+    return port
+
+
+def _token_file(session_id: str) -> str:
+    return f"/tmp/openeyes-web-tokens-{session_id}.json"
+
+
+def _history_dir(session_id: str) -> str:
+    return os.path.join(_HISTORY_ROOT, session_id)
+
+
+def _track(response: list, session_id: str) -> list:
+    """Estimate tokens in response and record for the active tab of this session."""
     tokens = 0
     for part in response:
         if isinstance(part, MCPImage):
             tokens += 1500  # ~896x630 JPEG ≈ 1500 Claude vision tokens
         elif isinstance(part, str):
             tokens += max(1, len(part) // 4)
-    if _browser and _browser._pages:
-        pid = id(_browser._pages[_browser._active])
+    browser = _browsers.get(session_id)
+    if browser and browser._pages:
+        pid = id(browser._pages[browser._active])
         _page_tokens[pid] = _page_tokens.get(pid, 0) + tokens
-        _write_token_stats()
-        _append_token_log(_browser._pages[_browser._active].url, tokens)
+        _write_token_stats(session_id)
+        _append_token_log(session_id, browser._pages[browser._active].url, tokens)
     return response
 
 
-def _write_token_stats():
-    """Write token stats to shared file for dashboard to read."""
-    import json
+def _write_token_stats(session_id: str) -> None:
+    """Write token stats for this session to shared file for dashboard to read."""
+    browser = _browsers.get(session_id)
+    if not browser:
+        return
     stats = [
-        {"url": page.url, "tokens": _page_tokens.get(id(page), 0), "model": _current_model, "session": _session}
-        for page in _browser._pages
+        {"url": page.url, "tokens": _page_tokens.get(id(page), 0),
+         "model": _current_model, "session": session_id}
+        for page in browser._pages
     ]
     try:
-        with open(_TOKEN_FILE, "w") as f:
+        with open(_token_file(session_id), "w") as f:
             json.dump(stats, f)
     except Exception:
         pass
 
 
-def _append_token_log(url: str, tokens: int):
-    """Append token usage to persistent log for historical tracking."""
-    import json
+def _append_token_log(session_id: str, url: str, tokens: int) -> None:
+    """Append token usage to persistent log (never rotated — kept for historical reporting)."""
     from datetime import datetime, timezone
     try:
         os.makedirs(os.path.dirname(_TOKEN_LOG), exist_ok=True)
@@ -130,16 +228,15 @@ def _append_token_log(url: str, tokens: int):
                 "url": url,
                 "tokens": tokens,
                 "model": _current_model,
-                "session": _session,
+                "session": session_id,
             }) + "\n")
     except Exception:
         pass
 
 
 def get_token_stats() -> list[dict]:
-    """Returns [{url, tokens, session}, ...] for all sessions. Reads all token files."""
+    """Returns [{url, tokens, model, session}, ...] across all sessions."""
     import glob
-    import json
     result = []
     for path in glob.glob("/tmp/openeyes-web-tokens-*.json"):
         try:
@@ -150,11 +247,75 @@ def get_token_stats() -> list[dict]:
     return result
 
 
-async def _get_browser() -> BrowserManager:
-    global _browser
-    if _browser is None:
-        _browser = BrowserManager(cdp_port=CDP_PORT)
-    return _browser
+def get_sessions() -> list[dict]:
+    """Return all known sessions with their port and last_active (for dashboard)."""
+    data = _load_sessions()
+    now = time.time()
+    result = []
+    for sid, rec in data.items():
+        last = rec.get("last_active", 0)
+        result.append({
+            "id": sid,
+            "port": rec.get("port"),
+            "last_active": last,
+            "idle_seconds": int(now - last) if last else None,
+            "active": sid in _browsers,
+        })
+    result.sort(key=lambda r: -(r["last_active"] or 0))
+    return result
+
+
+def _port_alive(port: int) -> bool:
+    """Quick check — is Chrome still listening on this CDP port?"""
+    import urllib.request
+    try:
+        urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=0.3)
+        return True
+    except Exception:
+        return False
+
+
+async def _get_browser(session_id: str) -> BrowserManager:
+    """Return (creating if needed) the BrowserManager for this session."""
+    global _cleanup_started
+    _last_active[session_id] = time.time()
+
+    if session_id in _browsers:
+        port = _session_ports.get(session_id)
+        # Chrome may have died since last call (e.g. user closed all tabs via dashboard).
+        # Drop the stale BrowserManager and fall through to re-launch a fresh Chrome.
+        if port is None or not _port_alive(port):
+            stale = _browsers.pop(session_id, None)
+            if stale:
+                try:
+                    await stale.close()
+                except Exception:
+                    pass
+            # Also reap the persisted record — port stays the same on recreate.
+            data = _load_sessions()
+            data.pop(session_id, None)
+            _save_sessions(data)
+            _session_ports.pop(session_id, None)
+        else:
+            _update_session_record(session_id, port)
+            if not _cleanup_started:
+                asyncio.create_task(_cleanup_loop())
+                _cleanup_started = True
+            return _browsers[session_id]
+
+    port = _allocate_port(session_id)
+    browser = BrowserManager(cdp_port=port)
+    _browsers[session_id] = browser
+    # Trigger actual Chrome launch so we can capture the PID.
+    await browser._ensure_browser()
+    _update_session_record(session_id, port, chrome_pid=browser._chrome_pid)
+    print(f"[openeyes-web] Session '{session_id}' → CDP port {port} (pid={browser._chrome_pid})", file=sys.stderr)
+
+    if not _cleanup_started:
+        asyncio.create_task(_cleanup_loop())
+        _cleanup_started = True
+
+    return browser
 
 
 def _get_vision() -> VisionPipeline:
@@ -171,14 +332,12 @@ def _get_memory() -> PageMemory:
     return _memory
 
 
-_HISTORY_DIR = os.path.expanduser(f"~/.openeyes/web/history/{_session}")
-
-async def _capture() -> tuple[bytes, bytes | None, str, float]:
+async def _capture(session_id: str) -> tuple[bytes, bytes | None, str, float]:
     """Take screenshot, process it.
 
     Returns (jpeg_bytes, crop_jpeg_or_none, context, diff_ratio).
     """
-    browser = await _get_browser()
+    browser = await _get_browser(session_id)
     vision = _get_vision()
     memory = _get_memory()
 
@@ -190,31 +349,29 @@ async def _capture() -> tuple[bytes, bytes | None, str, float]:
     title = await browser.get_page_title()
     context = memory.update(url, title, diff_ratio)
 
-    # Save screenshot to history
-    _save_screenshot(jpeg_bytes, url, title)
+    _save_screenshot(session_id, jpeg_bytes, url, title)
 
     return jpeg_bytes, crop_jpeg, context, diff_ratio
 
 
-def _save_screenshot(jpeg_bytes: bytes, url: str, title: str):
-    """Save screenshot to disk for history browsing."""
-    import json
+def _save_screenshot(session_id: str, jpeg_bytes: bytes, url: str, title: str) -> None:
+    """Save screenshot to disk for history browsing (per-session dir)."""
     from datetime import datetime, timezone
     try:
-        os.makedirs(_HISTORY_DIR, exist_ok=True)
+        hist = _history_dir(session_id)
+        os.makedirs(hist, exist_ok=True)
         ts = datetime.now(timezone.utc)
         filename = f"{ts.strftime('%Y%m%d_%H%M%S_%f')}.jpg"
-        filepath = os.path.join(_HISTORY_DIR, filename)
+        filepath = os.path.join(hist, filename)
         with open(filepath, "wb") as f:
             f.write(jpeg_bytes)
-        # Append to index
-        with open(os.path.join(_HISTORY_DIR, "index.jsonl"), "a") as f:
+        with open(os.path.join(hist, "index.jsonl"), "a") as f:
             f.write(json.dumps({
                 "ts": ts.isoformat(),
                 "file": filename,
                 "url": url,
                 "title": title,
-                "session": _session,
+                "session": session_id,
             }) + "\n")
     except Exception:
         pass
@@ -269,6 +426,58 @@ def _build_response(img: bytes, crop: bytes | None, context: str,
 
 
 # ---------------------------------------------------------------------------
+# TTL cleanup
+# ---------------------------------------------------------------------------
+
+async def _cleanup_loop() -> None:
+    """Background task: every _CLEANUP_INTERVAL seconds, close sessions idle > _TTL_SECONDS."""
+    while True:
+        try:
+            await asyncio.sleep(_CLEANUP_INTERVAL)
+            await _cleanup_expired()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[openeyes-web] Cleanup error: {e}", file=sys.stderr)
+
+
+async def _cleanup_expired() -> None:
+    """Close any session whose last_active is older than TTL. Chrome killed, logs kept."""
+    now = time.time()
+    data = _load_sessions()
+    changed = False
+
+    for sid, rec in list(data.items()):
+        last = rec.get("last_active", 0)
+        if last and (now - last) > _TTL_SECONDS:
+            browser = _browsers.pop(sid, None)
+            pid = rec.get("chrome_pid")
+            if browser:
+                try:
+                    await browser.close(kill_chrome=True)
+                except Exception as e:
+                    print(f"[openeyes-web] Failed to close session {sid}: {e}", file=sys.stderr)
+            elif pid:
+                # Session known from persisted state but no BrowserManager in memory
+                # (e.g., server restarted). Kill Chrome directly.
+                import signal
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                except Exception as e:
+                    print(f"[openeyes-web] Failed to kill pid {pid} for session {sid}: {e}", file=sys.stderr)
+            _last_active.pop(sid, None)
+            _session_ports.pop(sid, None)
+            data.pop(sid, None)
+            changed = True
+            print(f"[openeyes-web] Reclaimed idle session '{sid}' (idle {int(now - last)}s)", file=sys.stderr)
+
+    if changed:
+        _save_sessions(data)
+
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
@@ -295,29 +504,31 @@ async def set_model(model: str) -> str:
 
 
 @mcp.tool()
-async def navigate(url: str) -> list:
+async def navigate(url: str, ctx: Context) -> list:
     """Navigate to a URL. If a tab with that domain is already open, switches to it
     instead of navigating away. Use full URLs (with path) to navigate in the current tab.
     Examples: navigate("linkedin") → switches to LinkedIn tab. navigate("https://di.se/article/...") → opens in current tab."""
-    browser = await _get_browser()
+    sid = _session_id(ctx)
+    browser = await _get_browser(sid)
     status = await browser.navigate(url)
-    img, crop, context, _ = await _capture()
+    img, crop, context, _ = await _capture(sid)
     title = await browser.get_page_title()
     result = [MCPImage(data=img, format="jpeg")]
     tabs = browser.list_tabs()
     tab_info = " | ".join(f"[{t['index']}{'*' if t['active'] else ''}]{' 📌'+t['pin'] if t['pin'] else ''} {t['url'][:30]}" for t in tabs)
     text = f"{status}\n{context}\n\nURL: {browser.current_url}\nTitle: {title}\nTabs: {tab_info}"
     result.append(text)
-    return _track(result)
+    return _track(result, sid)
 
 
 @mcp.tool()
-async def click(x: int, y: int) -> list:
+async def click(x: int, y: int, ctx: Context) -> list:
     """Click at (x, y) coordinates on the screenshot.
     Look at the screenshot and estimate the pixel position of the element you want to click.
     Your click is automatically snapped to the nearest interactive element (button, link, input).
     The screenshot is ~896px wide and ~630px tall, with tick marks at 200px intervals."""
-    browser = await _get_browser()
+    sid = _session_id(ctx)
+    browser = await _get_browser(sid)
     vision = _get_vision()
 
     x = max(0, min(x, vision.actual_width - 1))
@@ -341,133 +552,158 @@ async def click(x: int, y: int) -> list:
     else:
         desc = f"No interactive element at ({x}, {y}) — raw click performed"
 
-    img, crop, context, diff_ratio = await _capture()
+    img, crop, context, diff_ratio = await _capture(sid)
     return _track(_build_response(img, crop, context,
                            f"{desc}\nURL: {browser.current_url}",
-                           diff_ratio, show_tiny_changes=True))
+                           diff_ratio, show_tiny_changes=True), sid)
 
 
 @mcp.tool()
-async def type_text(text: str, press_enter: bool = False, clear_first: bool = False) -> list:
+async def type_text(text: str, ctx: Context, press_enter: bool = False, clear_first: bool = False) -> list:
     """Type text into the currently focused element.
     Set clear_first=true to select-all and replace existing text.
     Set press_enter=true to submit (may navigate to new page)."""
-    browser = await _get_browser()
+    sid = _session_id(ctx)
+    browser = await _get_browser(sid)
     await browser.type_text(text, press_enter=press_enter, clear_first=clear_first)
 
     if press_enter:
         # Pressing enter may navigate — return screenshot
-        img, crop, context, diff_ratio = await _capture()
+        img, crop, context, diff_ratio = await _capture(sid)
         return _track(_build_response(img, crop, context,
                                f"Typed: '{text}' + Enter | URL: {browser.current_url}",
-                               diff_ratio))
+                               diff_ratio), sid)
 
     # No enter — page barely changed. Text-only response saves ~800 tokens.
-    return _track([f"Typed: '{text}' into focused element.\nURL: {browser.current_url}\n\nUse screenshot() to see the current page if needed."])
+    return _track([f"Typed: '{text}' into focused element.\nURL: {browser.current_url}\n\nUse screenshot() to see the current page if needed."], sid)
 
 
 @mcp.tool()
-async def scroll(direction: str = "down") -> list:
+async def scroll(ctx: Context, direction: str = "down") -> list:
     """Scroll the page. Direction: 'up' or 'down'."""
-    browser = await _get_browser()
+    sid = _session_id(ctx)
+    browser = await _get_browser(sid)
     await browser.scroll(direction)
 
-    img, crop, context, diff_ratio = await _capture()
+    img, crop, context, diff_ratio = await _capture(sid)
 
     if diff_ratio < 0.02:
         # Nothing new appeared — probably at top/bottom of page
-        return _track([f"Scrolled {direction} — no new content visible (may have reached the {'bottom' if direction == 'down' else 'top'}).\nURL: {browser.current_url}"])
+        return _track([f"Scrolled {direction} — no new content visible (may have reached the {'bottom' if direction == 'down' else 'top'}).\nURL: {browser.current_url}"], sid)
 
     return _track(_build_response(img, crop, context,
                            f"Scrolled {direction} | URL: {browser.current_url}",
-                           diff_ratio))
+                           diff_ratio), sid)
 
 
 @mcp.tool()
-async def get_text() -> str:
+async def get_text(ctx: Context) -> str:
     """Extract the main text content of the current page (article body, headings, paragraphs).
     Use this to read articles, blog posts, or any page with text content.
     Returns plain text with markdown headings — much faster than reading from screenshots."""
-    browser = await _get_browser()
+    sid = _session_id(ctx)
+    browser = await _get_browser(sid)
     text = await browser.get_page_text()
     result = f"URL: {browser.current_url}\n\n{text}"
-    _track([result])
+    _track([result], sid)
     return result
 
 
 @mcp.tool()
-async def go_back() -> list:
+async def go_back(ctx: Context) -> list:
     """Go back to the previous page."""
-    browser = await _get_browser()
+    sid = _session_id(ctx)
+    browser = await _get_browser(sid)
     await browser.back()
-    img, crop, context, _ = await _capture()
+    img, crop, context, _ = await _capture(sid)
     # Always full screenshot for navigation
     result = [MCPImage(data=img, format="jpeg")]
     result.append(f"{context}\n\nWent back | URL: {browser.current_url}")
-    return _track(result)
+    return _track(result, sid)
 
 
 @mcp.tool()
-async def screenshot() -> list:
+async def screenshot(ctx: Context) -> list:
     """Take a fresh screenshot of the current page."""
-    browser = await _get_browser()
-    img, _, context, _ = await _capture()
+    sid = _session_id(ctx)
+    browser = await _get_browser(sid)
+    img, _, context, _ = await _capture(sid)
     # Always full screenshot when explicitly requested
     result = [MCPImage(data=img, format="jpeg")]
     result.append(f"{context}\n\nURL: {browser.current_url}")
-    return _track(result)
+    return _track(result, sid)
 
 
 @mcp.tool()
-async def new_tab(url: str = "about:blank", pin: str = "") -> list:
+async def new_tab(ctx: Context, url: str = "about:blank", pin: str = "") -> list:
     """Open a new browser tab. Set pin="name" to make it findable by keyword
     and protect it from being closed. Example: new_tab("https://linkedin.com", pin="linkedin")"""
-    browser = await _get_browser()
+    sid = _session_id(ctx)
+    browser = await _get_browser(sid)
     index = await browser.new_tab(url, pin=pin)
-    img, crop, context, _ = await _capture()
+    img, crop, context, _ = await _capture(sid)
     tabs = browser.list_tabs()
     tab_info = "\n".join(f"  [{t['index']}] {'📌'+t['pin']+' ' if t['pin'] else ''}{'→ ' if t['active'] else '  '}{t['url']}" for t in tabs)
     result = [MCPImage(data=img, format="jpeg")]
     pin_msg = f" (pinned as '{pin}')" if pin else ""
     result.append(f"{context}\n\nOpened tab {index}{pin_msg} | URL: {browser.current_url}\n\nAll tabs:\n{tab_info}")
-    return _track(result)
+    return _track(result, sid)
 
 
 @mcp.tool()
-async def switch_tab(index: int) -> list:
+async def switch_tab(index: int, ctx: Context) -> list:
     """Switch to a different tab by index. Use list_tabs() to see available tabs."""
-    browser = await _get_browser()
+    sid = _session_id(ctx)
+    browser = await _get_browser(sid)
     await browser.switch_tab(index)
-    img, crop, context, _ = await _capture()
+    img, crop, context, _ = await _capture(sid)
     result = [MCPImage(data=img, format="jpeg")]
     result.append(f"Switched to tab {index} | URL: {browser.current_url}")
-    return _track(result)
+    return _track(result, sid)
 
 
 @mcp.tool()
-async def list_tabs() -> str:
+async def list_tabs(ctx: Context) -> str:
     """List all open browser tabs."""
-    browser = await _get_browser()
+    sid = _session_id(ctx)
+    browser = await _get_browser(sid)
     tabs = browser.list_tabs()
     lines = [f"[{t['index']}] {'→ ' if t['active'] else '  '}{t['url']}" for t in tabs]
     result = f"{len(tabs)} open tabs:\n" + "\n".join(lines)
-    _track([result])
+    _track([result], sid)
     return result
 
 
 @mcp.tool()
-async def close_tab(index: int) -> list:
-    """Close a tab by index. Cannot close pinned tabs or the last remaining tab."""
-    browser = await _get_browser()
+async def close_tab(index: int, ctx: Context) -> list:
+    """Close a tab by index. Pinned tabs cannot be closed.
+    Closing the last tab ends the session (Chrome exits, browser state discarded)."""
+    sid = _session_id(ctx)
+    browser = await _get_browser(sid)
     error = await browser.close_tab(index)
     if error:
         return [f"Cannot close tab {index}: {error}"]
-    img, crop, context, _ = await _capture()
+
+    # Last tab closed — tear down the session entirely.
+    if not browser._pages:
+        try:
+            await browser.close()  # Chrome exits on its own once all pages are gone
+        except Exception:
+            pass
+        _browsers.pop(sid, None)
+        _session_ports.pop(sid, None)
+        _last_active.pop(sid, None)
+        data = _load_sessions()
+        data.pop(sid, None)
+        _save_sessions(data)
+        return [f"Closed tab {index} — last tab, session '{sid}' ended."]
+
+    img, crop, context, _ = await _capture(sid)
     tabs = browser.list_tabs()
     tab_info = "\n".join(f"  [{t['index']}] {'📌'+t['pin']+' ' if t['pin'] else ''}{'→ ' if t['active'] else '  '}{t['url']}" for t in tabs)
     result = [MCPImage(data=img, format="jpeg")]
     result.append(f"Closed tab {index}\n\nAll tabs:\n{tab_info}")
-    return _track(result)
+    return _track(result, sid)
 
 
 def _start_dashboard():
@@ -492,8 +728,8 @@ def _start_dashboard():
 
 
 async def _warmup_browser():
-    """Start browser immediately so CDP is ready for dashboard."""
-    await _get_browser()
+    """Start the default session's browser immediately so CDP is ready for dashboard."""
+    await _get_browser("default")
 
 
 SSE_PORT = 6090
