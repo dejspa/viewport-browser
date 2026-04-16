@@ -32,8 +32,14 @@ The only DOM interaction is a single `elementFromPoint()` call at click time. It
 Start everything with a single command — MCP server, dashboard, and browser:
 
 ```bash
-viewport-serve
+git clone https://github.com/dejspa/viewport-browser
+cd viewport-browser
+uv sync
+uv run playwright install chromium
+uv run viewport-serve
 ```
+
+`uv run` uses the project's virtualenv without requiring `source .venv/bin/activate` or a global install.
 
 This starts:
 - **MCP server** on port 6090 (SSE for OpenClaw/remote agents)
@@ -47,7 +53,7 @@ All accessible from other machines on the network via the host IP.
 The dashboard can also be run standalone:
 
 ```bash
-viewport-dashboard
+uv run viewport-dashboard
 ```
 
 Opens at **http://localhost:6080**. Uses Chrome DevTools Protocol screencast — works on headless servers, no physical display needed.
