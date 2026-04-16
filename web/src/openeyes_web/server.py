@@ -643,24 +643,26 @@ async def screenshot(ctx: Context) -> list:
 
 
 @mcp.tool()
-async def new_tab(ctx: Context, url: str = "about:blank", pin: str = "") -> list:
-    """Open a new browser tab for a DIFFERENT site than any currently open.
+async def new_tab(ctx: Context, url: str = "about:blank", pin: str = "", force_new: bool = False) -> list:
+    """Open a new browser tab.
 
     Two different domains → two tabs. For example, if willys.se is already
     open, new_tab("https://gp.se") opens a second tab; you can switch_tab(0)
     to return to willys.
 
-    Same-domain reuse: if a tab for that domain is already open, this call
-    navigates the existing tab rather than opening a duplicate — so calling
-    new_tab("https://willys.se/choklad") when willys.se is already open will
-    reuse that tab, not create a second willys tab. This prevents agents
-    from accumulating duplicate tabs for the same site.
+    Same-domain default: if a tab for that domain is already open, the call
+    navigates the existing tab instead of opening a duplicate. This prevents
+    agents from accumulating duplicate tabs by accident.
 
-    Set pin="name" to tag a tab so you can tell them apart in list_tabs()
+    force_new=True overrides the dedup — use it when you deliberately want a
+    second tab for the same site (e.g. comparing two product pages on willys
+    side by side). Example: new_tab("https://willys.se/choklad", force_new=True).
+
+    Set pin="name" to tag a tab so you can tell duplicates apart in list_tabs()
     and protect it from close_tab. Example: new_tab("https://linkedin.com", pin="linkedin")"""
     sid = _session_id(ctx)
     browser = await _get_browser(sid)
-    index = await browser.new_tab(url, pin=pin)
+    index = await browser.new_tab(url, pin=pin, force_new=force_new)
     img, crop, context, _ = await _capture(sid)
     tabs = browser.list_tabs()
     tab_info = "\n".join(f"  [{t['index']}] {'📌'+t['pin']+' ' if t['pin'] else ''}{'→ ' if t['active'] else '  '}{t['url']}" for t in tabs)
