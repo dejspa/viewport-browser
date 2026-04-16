@@ -32,7 +32,7 @@ TOOLS:
 - get_text() — extract page text (article content, product details, prices)
 - go_back() — browser back
 - screenshot() — fresh screenshot
-- new_tab(url) — open a new tab (keeps existing tabs open)
+- new_tab(url) — open a tab for a different site (keeps existing tabs open; reuses the tab if that domain is already open)
 - switch_tab(index) — switch to a tab by index
 - list_tabs() — show all open tabs
 - close_tab(index) — close a tab
@@ -644,8 +644,20 @@ async def screenshot(ctx: Context) -> list:
 
 @mcp.tool()
 async def new_tab(ctx: Context, url: str = "about:blank", pin: str = "") -> list:
-    """Open a new browser tab. Set pin="name" to make it findable by keyword
-    and protect it from being closed. Example: new_tab("https://linkedin.com", pin="linkedin")"""
+    """Open a new browser tab for a DIFFERENT site than any currently open.
+
+    Two different domains → two tabs. For example, if willys.se is already
+    open, new_tab("https://gp.se") opens a second tab; you can switch_tab(0)
+    to return to willys.
+
+    Same-domain reuse: if a tab for that domain is already open, this call
+    navigates the existing tab rather than opening a duplicate — so calling
+    new_tab("https://willys.se/choklad") when willys.se is already open will
+    reuse that tab, not create a second willys tab. This prevents agents
+    from accumulating duplicate tabs for the same site.
+
+    Set pin="name" to tag a tab so you can tell them apart in list_tabs()
+    and protect it from close_tab. Example: new_tab("https://linkedin.com", pin="linkedin")"""
     sid = _session_id(ctx)
     browser = await _get_browser(sid)
     index = await browser.new_tab(url, pin=pin)
